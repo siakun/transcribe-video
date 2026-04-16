@@ -110,24 +110,113 @@ def empty_transcription_result(language: str) -> dict[str, Any]:
     return {"text": "", "segments": [], "language": detected}
 
 
+# 세그먼트 품질 임계값 — Whisper가 뱉은 메타데이터로 환각 여부를 판단한다.
+HALLUCINATION_LOGPROB_MAX = -1.0
+HALLUCINATION_NO_SPEECH_MIN = 0.6
+HALLUCINATION_COMPRESSION_MAX = 2.4
+# 긴 세그먼트인데 글자가 거의 없으면(= 무음에 YouTube outro 문구만 찍힌 케이스) 환각으로 본다.
+LOW_DENSITY_MIN_DURATION_SEC = 5.0
+LOW_DENSITY_MIN_CHARS_PER_SEC = 1.5
+# 한국어 Whisper가 학습 데이터의 YouTube outro에서 가져와 노이즈 구간에 자주 찍는 표현.
+# 공백을 지운 상태에서 substring 매칭한다.
+KOREAN_HALLUCINATION_PATTERNS: tuple[str, ...] = (
+    "시청해주셔서",
+    "시청해주셔서감사",
+    "구독과좋아요",
+    "구독좋아요",
+    "좋아요와구독",
+    "알림설정",
+    "다음영상",
+    "다음시간",
+    "다음영상에서만나",
+    "다음영상에서뵙",
+    "영상에서만나",
+    "영상에서뵙",
+    "만나뵙겠습니다",
+    "여러분안녕하세요",
+    "감사합니다",
+)
+# 패턴에 걸렸을 때 "진짜 말했을 수도 있다"를 배제하기 위해 둘 다 만족해야 drop.
+SUSPICIOUS_PATTERN_LOGPROB_MAX = -0.5
+SUSPICIOUS_PATTERN_NO_SPEECH_MIN = 0.3
+
+
+def _text_compact(text: str) -> str:
+    return "".join(text.split())
+
+
+def _looks_like_hallucination(seg: dict[str, Any]) -> bool:
+    text = str(seg.get("text", "")).strip()
+    if not text:
+        return True
+
+    avg_logprob = float(seg.get("avg_logprob", 0.0) or 0.0)
+    no_speech_prob = float(seg.get("no_speech_prob", 0.0) or 0.0)
+    compression_ratio = float(seg.get("compression_ratio", 0.0) or 0.0)
+
+    if avg_logprob < HALLUCINATION_LOGPROB_MAX:
+        return True
+    if no_speech_prob > HALLUCINATION_NO_SPEECH_MIN:
+        return True
+    if compression_ratio > HALLUCINATION_COMPRESSION_MAX:
+        return True
+
+    duration = float(seg.get("end", 0.0)) - float(seg.get("start", 0.0))
+    if duration >= LOW_DENSITY_MIN_DURATION_SEC:
+        density = len(text) / max(duration, 1e-6)
+        if density < LOW_DENSITY_MIN_CHARS_PER_SEC:
+            return True
+
+    compact = _text_compact(text)
+    if compact and any(pat in compact for pat in KOREAN_HALLUCINATION_PATTERNS):
+        if (
+            avg_logprob < SUSPICIOUS_PATTERN_LOGPROB_MAX
+            and no_speech_prob > SUSPICIOUS_PATTERN_NO_SPEECH_MIN
+        ):
+            return True
+
+    return False
+
+
+def _deoverlap_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(segments) <= 1:
+        return list(segments)
+    ordered = sorted(segments, key=lambda s: (float(s["start"]), float(s["end"])))
+    out: list[dict[str, Any]] = []
+    prev_end = float("-inf")
+    for seg in ordered:
+        start = float(seg["start"])
+        end = float(seg["end"])
+        if start < prev_end:
+            start = prev_end
+        if end <= start:
+            continue
+        clean = dict(seg)
+        clean["start"] = start
+        clean["end"] = end
+        out.append(clean)
+        prev_end = end
+    return out
+
+
 def normalize_transcription_result(result: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(result)
-    segments: list[dict[str, Any]] = []
-    text_parts: list[str] = []
+    kept: list[dict[str, Any]] = []
 
     for seg in result.get("segments", []):
         text = str(seg.get("text", "")).strip()
         if not text:
             continue
+        if _looks_like_hallucination(seg):
+            continue
         clean_seg = dict(seg)
         clean_seg["text"] = text
-        segments.append(clean_seg)
-        text_parts.append(text)
+        kept.append(clean_seg)
 
-    normalized["segments"] = segments
-    normalized["text"] = " ".join(text_parts).strip()
-    if not normalized["text"]:
-        normalized["text"] = str(result.get("text", "")).strip()
+    kept = _deoverlap_segments(kept)
+
+    normalized["segments"] = kept
+    normalized["text"] = " ".join(s["text"] for s in kept).strip()
     return normalized
 
 
