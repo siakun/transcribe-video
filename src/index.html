@@ -185,6 +185,35 @@
   .log-done    { color: #10b981; font-weight: 600; margin-top: 8px; border-top: 1px solid #1e2536; padding-top: 8px; }
   .log-progress { color: #10b981; white-space: pre-wrap; font-weight: 600; }
 
+  /* 콘솔 내부 실시간 진행 바 */
+  .log-progress-bar {
+    position: relative;
+    height: 22px;
+    background: #1e2536;
+    border: 1px solid #2d3748;
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 4px 0;
+  }
+  .log-progress-bar-fill {
+    position: absolute;
+    top: 0; left: 0; bottom: 0;
+    width: 0%;
+    background: linear-gradient(90deg, #059669, #10b981);
+    transition: width .2s ease;
+  }
+  .log-progress-bar-text {
+    position: relative;
+    z-index: 1;
+    padding: 3px 10px;
+    color: #e2e8f0;
+    font-weight: 600;
+    font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-size: 12px;
+    white-space: pre;
+    line-height: 16px;
+  }
+
   /* 진행 바 */
   .progress-bar-wrap {
     height: 3px; background: #1e2536; flex-shrink: 0;
@@ -432,18 +461,23 @@ function handleMessage(msg) {
   }
 
   switch (msg.type) {
-    case 'progress':
+    case 'progress': {
       const cProg = document.getElementById('console');
       let pEl = document.getElementById('curr-progress');
       if (!pEl) {
         pEl = document.createElement('div');
         pEl.id = 'curr-progress';
-        pEl.className = 'log-progress';
-        pEl.style.color = '#10b981'; // 녹색
+        pEl.className = 'log-progress-bar';
+        pEl.innerHTML = '<div class="log-progress-bar-fill"></div><div class="log-progress-bar-text"></div>';
         cProg.appendChild(pEl);
       }
-      pEl.textContent = msg.msg;
+      const pct = typeof msg.pct === 'number'
+        ? msg.pct
+        : (parseFloat(String(msg.msg).match(/([\d.]+)%/)?.[1]) || 0);
+      pEl.querySelector('.log-progress-bar-fill').style.width = Math.min(100, Math.max(0, pct)) + '%';
+      pEl.querySelector('.log-progress-bar-text').textContent = msg.msg;
       break;
+    }
 
     case 'log':
       const cls = msg.msg.includes('❌') ? 'error'
@@ -460,19 +494,27 @@ function handleMessage(msg) {
       logMsg(`\n[${msg.idx}/${msg.total}] 📄 ${msg.name}`, 'file');
       break;
 
-    case 'file_done':
+    case 'file_done': {
       const idx2 = allFiles.findIndex(f => f.name === msg.name);
       if (idx2 >= 0) {
-        markFile(idx2, msg.skipped ? 'complete' : 'complete');
+        markFile(idx2, 'complete');
         allFiles[idx2].done = true;
-        // 배지 갱신
+        if (msg.has_srt) allFiles[idx2].has_srt = true;
+        // 배지 갱신: TXT는 항상, SRT는 서버가 has_srt=true로 알려준 경우에만.
+        // 이전에는 TXT만 하드코딩으로 넣어서 실제 디스크엔 .srt가 있어도
+        // 새로고침 전까진 SRT 배지가 안 붙는 버그가 있었다.
         const si = document.getElementById(`fi-${idx2}`);
-        if (si) si.querySelector('.file-status').innerHTML = '<span class="txt-badge">TXT</span>';
+        if (si) {
+          si.querySelector('.file-status').innerHTML =
+            '<span class="txt-badge">TXT</span>' +
+            (allFiles[idx2].has_srt ? '<span class="srt-badge">SRT</span>' : '');
+        }
       }
       doneFiles++;
       updateProgress(doneFiles, totalFiles);
       if (msg.preview) logMsg(`  미리보기: "${msg.preview.trim().substring(0,80)}..."`, 'info');
       break;
+    }
 
     case 'file_error':
       const idx3 = allFiles.findIndex(f => f.name === msg.name);

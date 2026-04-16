@@ -289,6 +289,20 @@ async def _run_transcribe_with_progress(
             if tag == TAG_ERR:
                 raise payload
             if tag == TAG_DONE:
+                # 마지막 음성 세그먼트 end가 항상 info.duration에 도달하는 건
+                # 아니라 99%대에서 끝난 것처럼 보이는 경우가 있다. 전사 자체는
+                # 여기서 완전히 끝난 시점이므로 100% progress를 한 번 마지막으로
+                # 내보내 UI의 진행 바가 가득 차도록 한다.
+                if info_obj and info_obj.duration and info_obj.duration > 0:
+                    total_hms = _format_hms(info_obj.duration)
+                    try:
+                        await websocket.send_json({
+                            "type": "progress",
+                            "msg": f"100.0% | {total_hms} / {total_hms}",
+                            "pct": 100.0,
+                        })
+                    except Exception:
+                        pass
                 break
             if tag == TAG_INFO:
                 info_obj = payload
@@ -322,7 +336,11 @@ async def _run_transcribe_with_progress(
                 pct = min(100.0, cur / total * 100.0)
                 msg = f"{pct:5.1f}% | {_format_hms(cur)} / {_format_hms(total)}"
                 try:
-                    await websocket.send_json({"type": "progress", "msg": msg})
+                    await websocket.send_json({
+                        "type": "progress",
+                        "msg": msg,
+                        "pct": pct,
+                    })
                 except Exception:
                     # WebSocket이 중간에 닫혀도 전사 자체는 끝까지 간다.
                     pass
@@ -431,7 +449,13 @@ async def ws_transcribe(websocket: WebSocket):
             # 이미 처리된 파일
             if p.with_suffix(".txt").exists():
                 await websocket.send_json({"type": "log", "msg": f"  ⏭ 건너뜀 (이미 완료): {p.name}"})
-                await websocket.send_json({"type": "file_done", "idx": idx, "name": p.name, "skipped": True})
+                await websocket.send_json({
+                    "type": "file_done",
+                    "idx": idx,
+                    "name": p.name,
+                    "skipped": True,
+                    "has_srt": p.with_suffix(".srt").exists(),
+                })
                 continue
 
             # 오디오 추출
@@ -496,6 +520,7 @@ async def ws_transcribe(websocket: WebSocket):
                     "language": detected,
                     "skipped": False,
                     "preview": "",
+                    "has_srt": make_srt,
                 })
                 await websocket.send_json({
                     "type": "log",
@@ -552,6 +577,7 @@ async def ws_transcribe(websocket: WebSocket):
                 "language": detected,
                 "skipped": False,
                 "preview": result["text"][:200],
+                "has_srt": make_srt,
             })
             await websocket.send_json({
                 "type": "log",
