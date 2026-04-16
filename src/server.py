@@ -33,6 +33,13 @@ APP_NAME = "whisper_server"
 IS_FROZEN = is_frozen()
 LOG_TIMESTAMP_FORMAT = "%Y/%m/%d %H:%M:%S"
 
+# faster-whisper(CTranslate2)와 PyTorch가 각자 OpenMP 런타임을 들고 있는데,
+# PyInstaller frozen 빌드에서 두 OMP DLL이 같은 프로세스에 로드되면 종료 시점
+# 또는 스레드 풀 정리 시점에 네이티브 abort가 나는 사례가 관측되므로 진입
+# 전에 libomp 중복 로드를 허용하고 OpenMP 스레드 수를 보수적으로 고정한다.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 
 def _open_log_stream() -> tuple[Path, TextIO]:
     try:
@@ -155,6 +162,14 @@ async def log_shutdown():
 # ─────────────────────────────────────────────
 is_running = False
 cancel_flag = threading.Event()
+
+# 로드된 WhisperModel을 세션 간에 공유한다. 함수 로컬에 두면 핸들러 리턴 시
+# GC가 CTranslate2 모델을 해제하면서 Windows frozen 빌드에서 "Fatal Python
+# error: Aborted"로 터지는 현상이 있었고, 같은 모델로 여러 파일을 돌릴 때
+# 재로드 비용도 불필요하므로 모듈 전역에 하나만 유지한다.
+_model_cache_lock = threading.Lock()
+_cached_model = None
+_cached_model_key: tuple | None = None
 
 
 # ─────────────────────────────────────────────
@@ -375,11 +390,27 @@ async def ws_transcribe(websocket: WebSocket):
         })
 
         loop = asyncio.get_event_loop()
-        wmodel = await loop.run_in_executor(
-            None,
-            lambda: WhisperModel(model_name, device=device, compute_type=compute_type),
-        )
-        await websocket.send_json({"type": "log", "msg": "[모델 로딩] 완료 ✓"})
+
+        def _load_or_get_cached():
+            global _cached_model, _cached_model_key
+            key = (model_name, device, compute_type)
+            with _model_cache_lock:
+                if _cached_model is not None and _cached_model_key == key:
+                    return _cached_model, True
+                # 모델 키가 바뀌면 기존 캐시를 먼저 비워서 두 개의 CTranslate2
+                # 모델이 동시에 GPU 메모리를 점유하지 않게 한다.
+                _cached_model = None
+                _cached_model_key = None
+                new_model = WhisperModel(model_name, device=device, compute_type=compute_type)
+                _cached_model = new_model
+                _cached_model_key = key
+                return new_model, False
+
+        wmodel, was_cached = await loop.run_in_executor(None, _load_or_get_cached)
+        await websocket.send_json({
+            "type": "log",
+            "msg": "[모델 로딩] 완료 ✓ (캐시 재사용)" if was_cached else "[모델 로딩] 완료 ✓",
+        })
 
         import time
 
