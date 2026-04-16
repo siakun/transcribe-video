@@ -1,0 +1,349 @@
+"""
+FastAPI 서버 - Whisper 음성인식 + 실시간 WebSocket 스트리밍
+실행: python src/server.py
+"""
+
+import os
+import sys
+import re
+import asyncio
+import threading
+import queue
+import subprocess
+import contextlib
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+import uvicorn
+
+app = FastAPI(title="Whisper 음성인식 서버")
+
+# ─────────────────────────────────────────────
+# 전역 상태
+# ─────────────────────────────────────────────
+is_running = False
+cancel_flag = threading.Event()
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+# ─────────────────────────────────────────────
+# HTML 제공
+# ─────────────────────────────────────────────
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    html_path = Path(__file__).parent / "index.html"
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
+
+# ─────────────────────────────────────────────
+# 폴더 스캔 API
+# ─────────────────────────────────────────────
+@app.get("/api/scan")
+async def scan_folder(folder: str):
+    folder_path = Path(folder)
+    if not folder_path.exists():
+        return JSONResponse({"error": f"폴더를 찾을 수 없습니다: {folder}"}, status_code=404)
+    if not folder_path.is_dir():
+        return JSONResponse({"error": "폴더 경로가 아닙니다."}, status_code=400)
+
+    def natural_key(p: Path):
+        """1강 < 2강 < 3강 ... < 10강 < 11강 순으로 정렬"""
+        return [int(c) if c.isdigit() else c.lower()
+                for c in re.split(r'(\d+)', p.name)]
+
+    extensions = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v"}
+    all_files_found = []
+    for ext in extensions:
+        all_files_found.extend(folder_path.rglob(f"*{ext}"))
+
+    files = []
+    for p in sorted(all_files_found, key=natural_key):
+            txt_exists = p.with_suffix(".txt").exists()
+            srt_exists = p.with_suffix(".srt").exists()
+            files.append({
+                "name": p.name,
+                "path": str(p),
+                "rel": str(p.relative_to(folder_path)),
+                "size_mb": round(p.stat().st_size / 1024 / 1024, 1),
+                "done": txt_exists,
+                "has_srt": srt_exists,
+            })
+
+    return JSONResponse({"folder": str(folder_path), "count": len(files), "files": files})
+
+
+# ─────────────────────────────────────────────
+# 취소 API
+# ─────────────────────────────────────────────
+@app.post("/api/cancel")
+async def cancel():
+    global is_running
+    cancel_flag.set()
+    is_running = False
+    return {"ok": True}
+
+
+# ─────────────────────────────────────────────
+# WebSocket 로깅용 스트림
+# ─────────────────────────────────────────────
+class WsStream:
+    def __init__(self, relay):
+        self.relay = relay
+        self.buf = ""
+
+    def write(self, s):
+        sys.__stderr__.write(s)
+        sys.__stderr__.flush()
+        self.buf += s
+        while "\r" in self.buf or "\n" in self.buf:
+            idx_r = self.buf.find("\r")
+            idx_n = self.buf.find("\n")
+            
+            if idx_r != -1 and (idx_n == -1 or idx_r < idx_n):
+                line = self.buf[:idx_r]
+                self.buf = self.buf[idx_r+1:]
+            else:
+                line = self.buf[:idx_n]
+                self.buf = self.buf[idx_n+1:]
+                
+            self.relay.push(line)
+
+    def flush(self):
+        sys.__stderr__.flush()
+        if self.buf:
+            self.relay.push(self.buf)
+            self.buf = ""
+
+
+class ProgressRelay:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.latest: Optional[str] = None
+        self.closed = False
+
+    def push(self, line: str):
+        clean = ANSI_ESCAPE_RE.sub("", line).strip()
+        if not clean or clean.startswith("warnings.warn"):
+            return
+        with self.lock:
+            self.latest = clean
+
+    def pop_latest(self) -> Optional[str]:
+        with self.lock:
+            line = self.latest
+            self.latest = None
+            return line
+
+    def has_pending(self) -> bool:
+        with self.lock:
+            return self.latest is not None
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+
+    def is_closed(self) -> bool:
+        with self.lock:
+            return self.closed
+
+
+async def pump_progress(relay: ProgressRelay, websocket: WebSocket):
+    last_sent = None
+    try:
+        while not relay.is_closed() or relay.has_pending():
+            line = relay.pop_latest()
+            if line and line != last_sent:
+                await websocket.send_json({"type": "progress", "msg": line})
+                last_sent = line
+            else:
+                await asyncio.sleep(0.12)
+    except Exception:
+        relay.close()
+
+
+# ─────────────────────────────────────────────
+# WebSocket - 실시간 변환
+# ─────────────────────────────────────────────
+@app.websocket("/ws/transcribe")
+async def ws_transcribe(websocket: WebSocket):
+    global is_running
+    await websocket.accept()
+    progress_relay = ProgressRelay()
+    progress_task = asyncio.create_task(pump_progress(progress_relay, websocket))
+
+    try:
+        data = await websocket.receive_json()
+        files: list[str] = data.get("files", [])
+        model: str = data.get("model", "turbo")
+        language: str = data.get("language", "ko")
+        make_srt: bool = data.get("srt", True)
+
+        if not files:
+            await websocket.send_json({"type": "error", "msg": "파일이 선택되지 않았습니다."})
+            return
+
+        if is_running:
+            await websocket.send_json({"type": "error", "msg": "이미 변환이 실행 중입니다."})
+            return
+
+        is_running = True
+        cancel_flag.clear()
+
+        await websocket.send_json({"type": "start", "total": len(files)})
+
+        # 모델 로딩 (한 번만)
+        await websocket.send_json({"type": "log", "msg": f"[모델 로딩] whisper {model} 로딩 중..."})
+
+        import whisper
+        import torch
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else "CPU"
+        await websocket.send_json({"type": "log", "msg": f"[GPU] {gpu_name} 사용"})
+
+        # 별도 스레드에서 모델 로딩 (블로킹 방지)
+        loop = asyncio.get_event_loop()
+        wmodel = await loop.run_in_executor(None, lambda: whisper.load_model(model, device=device))
+        await websocket.send_json({"type": "log", "msg": f"[모델 로딩] 완료 ✓"})
+
+        import time
+
+        for idx, file_path in enumerate(files, 1):
+            if cancel_flag.is_set():
+                await websocket.send_json({"type": "cancelled", "msg": "사용자가 취소했습니다."})
+                break
+
+            p = Path(file_path)
+            await websocket.send_json({
+                "type": "file_start",
+                "idx": idx,
+                "total": len(files),
+                "name": p.name,
+                "path": file_path,
+            })
+
+            # 이미 처리된 파일
+            if p.with_suffix(".txt").exists():
+                await websocket.send_json({"type": "log", "msg": f"  ⏭ 건너뜀 (이미 완료): {p.name}"})
+                await websocket.send_json({"type": "file_done", "idx": idx, "name": p.name, "skipped": True})
+                continue
+
+            # 오디오 추출
+            await websocket.send_json({"type": "log", "msg": f"  🎬 오디오 추출 중..."})
+            audio_path = p.with_name(p.stem + "_temp.wav")
+
+            try:
+                # ffmpeg가 한글 경로를 인식하지 못하는 버그를 피하기 위해,
+                # Python에서 파일을 열어 ffmpeg stdin으로 직접 파이프합니다.
+                with open(p, "rb") as video_file:
+                    proc = await asyncio.create_subprocess_exec(
+                        "ffmpeg", "-y", "-i", "pipe:0",
+                        "-ac", "1", "-ar", "16000", "-vn", str(audio_path),
+                        stdin=video_file,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    _, stderr = await proc.communicate()
+                    
+                    if proc.returncode != 0:
+                        await websocket.send_json({"type": "log", "msg": f"  ❌ ffmpeg 오류: {stderr.decode(errors='replace')[-300:]}"})
+                        await websocket.send_json({"type": "file_error", "idx": idx, "name": p.name})
+                        continue
+            except FileNotFoundError:
+                await websocket.send_json({"type": "log", "msg": "  ❌ ffmpeg를 찾을 수 없습니다. 설치 필요: winget install ffmpeg"})
+                break
+
+            await websocket.send_json({"type": "log", "msg": f"  🤖 음성 인식 중... (모델: {model})"})
+            t0 = time.time()
+
+            # 블로킹 인식 → executor에서 실행
+            def do_transcribe():
+                stream = WsStream(progress_relay)
+                with contextlib.redirect_stderr(stream), contextlib.redirect_stdout(stream):
+                    try:
+                        return wmodel.transcribe(
+                            str(audio_path),
+                            language=language if language != "auto" else None,
+                            fp16=(device == "cuda"),
+                            verbose=False,
+                            condition_on_previous_text=True,
+                            no_speech_threshold=0.6,
+                            compression_ratio_threshold=2.4,
+                        )
+                    finally:
+                        stream.flush()
+
+            try:
+                result = await loop.run_in_executor(None, do_transcribe)
+            except Exception as e:
+                await websocket.send_json({"type": "log", "msg": f"  ❌ 인식 오류: {e}"})
+                await websocket.send_json({"type": "file_error", "idx": idx, "name": p.name})
+                if audio_path.exists():
+                    audio_path.unlink()
+                continue
+
+            elapsed = round(time.time() - t0)
+            detected = result.get("language", "?")
+
+            # 텍스트 저장
+            txt_path = p.with_suffix(".txt")
+            txt_path.write_text(result["text"], encoding="utf-8")
+            await websocket.send_json({"type": "log", "msg": f"  💾 저장: {txt_path.name}"})
+
+            # SRT 저장
+            if make_srt:
+                srt_path = p.with_suffix(".srt")
+                srt_lines = []
+                for i, seg in enumerate(result["segments"], 1):
+                    def ts(s):
+                        h, r = divmod(s, 3600)
+                        m, s2 = divmod(r, 60)
+                        return f"{int(h):02d}:{int(m):02d}:{int(s2):02d},{int((s2%1)*1000):03d}"
+                    srt_lines.append(f"{i}\n{ts(seg['start'])} --> {ts(seg['end'])}\n{seg['text'].strip()}\n")
+                srt_path.write_text("\n".join(srt_lines), encoding="utf-8")
+                await websocket.send_json({"type": "log", "msg": f"  💾 저장: {srt_path.name}"})
+
+            # 임시 파일 삭제
+            if audio_path.exists():
+                audio_path.unlink()
+
+            await websocket.send_json({
+                "type": "file_done",
+                "idx": idx,
+                "name": p.name,
+                "elapsed": elapsed,
+                "language": detected,
+                "skipped": False,
+                "preview": result["text"][:200],
+            })
+            await websocket.send_json({
+                "type": "log",
+                "msg": f"  ✅ 완료 ({elapsed}초) | 언어: {detected}",
+            })
+
+        if not cancel_flag.is_set():
+            await websocket.send_json({"type": "done", "msg": "모든 파일 처리 완료!"})
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        await websocket.send_json({"type": "error", "msg": str(e)})
+    finally:
+        is_running = False
+        cancel_flag.clear()
+        progress_relay.close()
+        await progress_task
+
+
+# ─────────────────────────────────────────────
+# 실행
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=" * 50)
+    print("  Whisper 음성인식 서버 시작")
+    print("  브라우저에서 열기: http://localhost:8765")
+    print("=" * 50)
+    uvicorn.run(app, host="0.0.0.0", port=8765, log_level="warning")

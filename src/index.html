@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Whisper 음성인식</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Segoe UI', sans-serif;
+    background: #0f1117;
+    color: #e2e8f0;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── 헤더 ── */
+  header {
+    background: #1a1d2e;
+    border-bottom: 1px solid #2d3748;
+    padding: 14px 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
+  header h1 { font-size: 16px; font-weight: 600; color: #a78bfa; }
+  .badge {
+    font-size: 11px; background: #2d3748; color: #94a3b8;
+    padding: 2px 8px; border-radius: 20px;
+  }
+
+  /* ── 메인 레이아웃 ── */
+  .main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* ── 왼쪽 패널 ── */
+  .panel-left {
+    width: 420px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid #2d3748;
+    overflow: hidden;
+  }
+
+  .section {
+    padding: 16px;
+    border-bottom: 1px solid #1e2536;
+  }
+  .section-title {
+    font-size: 11px; font-weight: 600; color: #64748b;
+    text-transform: uppercase; letter-spacing: .08em;
+    margin-bottom: 10px;
+  }
+
+  /* 폴더 입력 */
+  .folder-row {
+    display: flex; gap: 8px;
+  }
+  .folder-input {
+    flex: 1;
+    background: #1e2536; border: 1px solid #2d3748;
+    color: #e2e8f0; border-radius: 6px;
+    padding: 8px 10px; font-size: 13px;
+    outline: none;
+    transition: border-color .2s;
+  }
+  .folder-input:focus { border-color: #7c3aed; }
+
+  /* 설정 행 */
+  .settings-row {
+    display: flex; gap: 10px; margin-top: 10px;
+  }
+  .settings-row label { font-size: 12px; color: #94a3b8; display: flex; align-items: center; gap: 6px; }
+  select, .btn-sm {
+    background: #1e2536; border: 1px solid #2d3748;
+    color: #e2e8f0; border-radius: 5px;
+    padding: 5px 8px; font-size: 12px; cursor: pointer;
+  }
+  select { outline: none; }
+
+  /* 버튼 */
+  .btn {
+    padding: 8px 14px; border-radius: 6px; border: none;
+    font-size: 13px; font-weight: 600; cursor: pointer;
+    transition: all .15s; white-space: nowrap;
+  }
+  .btn-primary   { background: #7c3aed; color: #fff; }
+  .btn-primary:hover   { background: #6d28d9; }
+  .btn-secondary { background: #2d3748; color: #e2e8f0; }
+  .btn-secondary:hover { background: #374151; }
+  .btn-danger    { background: #dc2626; color: #fff; }
+  .btn-danger:hover    { background: #b91c1c; }
+  .btn:disabled  { opacity: .4; cursor: not-allowed; }
+
+  /* 파일 리스트 */
+  .file-list-header {
+    padding: 10px 16px;
+    font-size: 12px; color: #64748b;
+    display: flex; justify-content: space-between; align-items: center;
+    border-bottom: 1px solid #1e2536;
+    flex-shrink: 0;
+  }
+  .file-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 6px 0;
+  }
+  .file-list::-webkit-scrollbar { width: 4px; }
+  .file-list::-webkit-scrollbar-track { background: #1e2536; }
+  .file-list::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 2px; }
+
+  .file-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 16px;
+    cursor: pointer;
+    transition: background .1s;
+    border-left: 3px solid transparent;
+  }
+  .file-item:hover { background: #1a1d2e; }
+  .file-item.selected { border-left-color: #7c3aed; background: #1a1d2e; }
+  .file-item.done { opacity: 0.55; }
+  .file-item.processing { border-left-color: #f59e0b; background: #1e1a0e; }
+  .file-item.complete { border-left-color: #10b981; background: #0e1e18; }
+  .file-item.error { border-left-color: #ef4444; background: #1e0e0e; }
+
+  .file-item input[type=checkbox] { accent-color: #7c3aed; flex-shrink: 0; }
+
+  .file-name { font-size: 13px; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .file-meta { font-size: 11px; color: #64748b; flex-shrink: 0; }
+  .file-status { font-size: 11px; flex-shrink: 0; }
+
+  /* 하단 실행 버튼 영역 */
+  .action-bar {
+    padding: 12px 16px;
+    border-top: 1px solid #2d3748;
+    display: flex; gap: 8px; align-items: center;
+    flex-shrink: 0;
+  }
+  .action-bar .progress-text { flex: 1; font-size: 12px; color: #94a3b8; }
+
+  /* ── 오른쪽: 콘솔 ── */
+  .console-wrap {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .console-header {
+    padding: 10px 16px;
+    display: flex; align-items: center; gap: 8px;
+    border-bottom: 1px solid #2d3748;
+    flex-shrink: 0;
+  }
+  .console-title { font-size: 13px; font-weight: 600; color: #94a3b8; flex: 1; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #374151; }
+  .dot.active { background: #10b981; animation: pulse 1.2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+  #console {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 16px;
+    font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-size: 12.5px;
+    line-height: 1.7;
+    background: #090b10;
+  }
+  #console::-webkit-scrollbar { width: 4px; }
+  #console::-webkit-scrollbar-track { background: #0f1117; }
+  #console::-webkit-scrollbar-thumb { background: #374151; border-radius: 2px; }
+
+  .log-info    { color: #94a3b8; }
+  .log-success { color: #34d399; }
+  .log-warn    { color: #fbbf24; }
+  .log-error   { color: #f87171; }
+  .log-file    { color: #a78bfa; font-weight: 600; margin-top: 6px; }
+  .log-done    { color: #10b981; font-weight: 600; margin-top: 8px; border-top: 1px solid #1e2536; padding-top: 8px; }
+  .log-progress { color: #10b981; white-space: pre-wrap; font-weight: 600; }
+
+  /* 진행 바 */
+  .progress-bar-wrap {
+    height: 3px; background: #1e2536; flex-shrink: 0;
+  }
+  .progress-bar {
+    height: 100%; background: linear-gradient(90deg, #7c3aed, #a78bfa);
+    width: 0%; transition: width .3s ease;
+  }
+
+  /* 빈 상태 */
+  .empty {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    color: #374151; height: 100%; gap: 10px; text-align: center;
+  }
+  .empty svg { width: 40px; opacity: .3; }
+  .empty p { font-size: 13px; }
+
+  .srt-badge { background: #1d4ed8; color: #bfdbfe; font-size: 10px; padding: 1px 5px; border-radius: 3px; }
+  .txt-badge { background: #065f46; color: #a7f3d0; font-size: 10px; padding: 1px 5px; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🎙 Whisper 로컬 음성인식</h1>
+  <span class="badge">openai-whisper • GPU 로컬</span>
+</header>
+
+<div class="main">
+  <!-- 왼쪽 패널 -->
+  <div class="panel-left">
+
+    <!-- 폴더 선택 -->
+    <div class="section">
+      <div class="section-title">폴더 경로</div>
+      <div class="folder-row">
+        <input class="folder-input" id="folderPath" type="text"
+          value="Z:\Library\Education\1. 파이썬 활용 인공지능 이론과 실습"
+          placeholder="폴더 경로를 입력하세요" />
+        <button class="btn btn-secondary" onclick="scanFolder()">🔍 스캔</button>
+      </div>
+
+      <div class="settings-row">
+        <label>
+          모델
+          <select id="modelSelect">
+            <option value="turbo" selected>turbo (권장·빠름)</option>
+            <option value="large-v3">large-v3 (최고정확도)</option>
+            <option value="medium">medium</option>
+            <option value="small">small</option>
+          </select>
+        </label>
+        <label>
+          언어
+          <select id="langSelect">
+            <option value="ko" selected>한국어</option>
+            <option value="en">English</option>
+            <option value="auto">자동감지</option>
+          </select>
+        </label>
+        <label>
+          <input type="checkbox" id="srtCheck" checked> SRT 자막
+        </label>
+      </div>
+    </div>
+
+    <!-- 파일 목록 헤더 -->
+    <div class="file-list-header">
+      <span id="fileCount">파일 0개</span>
+      <div style="display:flex;gap:8px">
+        <button class="btn-sm" onclick="selectAll()">전체선택</button>
+        <button class="btn-sm" onclick="selectPending()">미완료만</button>
+        <button class="btn-sm" onclick="deselectAll()">선택해제</button>
+      </div>
+    </div>
+
+    <!-- 파일 리스트 -->
+    <div class="file-list" id="fileList">
+      <div class="empty">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"/>
+        </svg>
+        <p>폴더를 스캔하면<br>MP4 파일 목록이 나타납니다</p>
+      </div>
+    </div>
+
+    <!-- 실행 버튼 -->
+    <div class="action-bar">
+      <button class="btn btn-primary" id="btnStart" onclick="startTranscribe()" disabled>▶ 변환 시작</button>
+      <button class="btn btn-danger"  id="btnStop"  onclick="stopTranscribe()" style="display:none">⏹ 중지</button>
+      <span class="progress-text" id="progressText"></span>
+    </div>
+    <div class="progress-bar-wrap"><div class="progress-bar" id="progressBar"></div></div>
+  </div>
+
+  <!-- 오른쪽: 콘솔 -->
+  <div class="console-wrap">
+    <div class="console-header">
+      <div class="dot" id="statusDot"></div>
+      <span class="console-title">콘솔 출력</span>
+      <button class="btn-sm" onclick="clearConsole()">지우기</button>
+    </div>
+    <div id="console">
+      <span class="log-info">서버에 연결되면 여기에 실시간 로그가 출력됩니다.</span>
+    </div>
+  </div>
+</div>
+
+<script>
+// ─────────────────────────────
+// 상태
+// ─────────────────────────────
+let allFiles = [];
+let ws = null;
+let totalFiles = 0;
+let doneFiles  = 0;
+
+// ─────────────────────────────
+// 폴더 스캔
+// ─────────────────────────────
+async function scanFolder() {
+  const folder = document.getElementById('folderPath').value.trim();
+  if (!folder) return;
+
+  logMsg('📂 스캔 중: ' + folder, 'info');
+  const res = await fetch('/api/scan?folder=' + encodeURIComponent(folder));
+  const data = await res.json();
+
+  if (data.error) {
+    logMsg('❌ ' + data.error, 'error');
+    return;
+  }
+
+  allFiles = data.files;
+  renderFileList();
+  logMsg(`✅ ${data.count}개 파일 발견 (완료: ${allFiles.filter(f=>f.done).length}개)`, 'success');
+}
+
+// ─────────────────────────────
+// 파일 목록 렌더링
+// ─────────────────────────────
+function renderFileList() {
+  const el = document.getElementById('fileList');
+  document.getElementById('fileCount').textContent = `파일 ${allFiles.length}개`;
+
+  if (!allFiles.length) {
+    el.innerHTML = '<div class="empty"><p>MP4 파일이 없습니다</p></div>';
+    document.getElementById('btnStart').disabled = true;
+    return;
+  }
+
+  el.innerHTML = allFiles.map((f, i) => `
+    <div class="file-item ${f.done?'done':''}" id="fi-${i}">
+      <input type="checkbox" id="chk-${i}" ${!f.done ? 'checked' : ''}>
+      <span class="file-name" title="${f.path}">${f.name}</span>
+      <span class="file-meta">${f.size_mb}MB</span>
+      <span class="file-status">
+        ${f.done ? '<span class="txt-badge">TXT</span>' : ''}
+        ${f.has_srt ? '<span class="srt-badge">SRT</span>' : ''}
+      </span>
+    </div>
+  `).join('');
+
+  // 클릭으로 체크박스 토글
+  allFiles.forEach((_, i) => {
+    document.getElementById(`fi-${i}`).addEventListener('click', e => {
+      if (e.target.tagName !== 'INPUT') {
+        const chk = document.getElementById(`chk-${i}`);
+        chk.checked = !chk.checked;
+      }
+      updateStartBtn();
+    });
+  });
+
+  updateStartBtn();
+}
+
+function updateStartBtn() {
+  const selected = getSelected();
+  document.getElementById('btnStart').disabled = selected.length === 0;
+}
+
+function getSelected() {
+  return allFiles.filter((_, i) => {
+    const c = document.getElementById(`chk-${i}`);
+    return c && c.checked;
+  }).map(f => f.path);
+}
+
+function selectAll()     { allFiles.forEach((_, i) => document.getElementById(`chk-${i}`).checked = true);  updateStartBtn(); }
+function deselectAll()   { allFiles.forEach((_, i) => document.getElementById(`chk-${i}`).checked = false); updateStartBtn(); }
+function selectPending() { allFiles.forEach((f, i) => document.getElementById(`chk-${i}`).checked = !f.done); updateStartBtn(); }
+
+// ─────────────────────────────
+// 변환 시작 (WebSocket)
+// ─────────────────────────────
+function startTranscribe() {
+  const files = getSelected();
+  if (!files.length) return;
+
+  const model = document.getElementById('modelSelect').value;
+  const lang  = document.getElementById('langSelect').value;
+  const srt   = document.getElementById('srtCheck').checked;
+
+  totalFiles = files.length;
+  doneFiles  = 0;
+  updateProgress(0, totalFiles);
+
+  setRunning(true);
+  logMsg(`▶ 변환 시작 — ${files.length}개 파일 | 모델: ${model} | 언어: ${lang}`, 'file');
+
+  ws = new WebSocket(`ws://${location.host}/ws/transcribe`);
+
+  ws.onopen = () => {
+    document.getElementById('statusDot').classList.add('active');
+    ws.send(JSON.stringify({ files, model, language: lang, srt }));
+  };
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    handleMessage(msg);
+  };
+
+  ws.onclose = () => {
+    document.getElementById('statusDot').classList.remove('active');
+    setRunning(false);
+  };
+
+  ws.onerror = () => {
+    logMsg('❌ WebSocket 연결 오류', 'error');
+    setRunning(false);
+  };
+}
+
+function handleMessage(msg) {
+  // progress가 아닌 다른 로그가 오면 기존 진행바의 id를 제거하여 줄바꿈되게 함
+  if (msg.type !== 'progress') {
+    const oldP = document.getElementById('curr-progress');
+    if (oldP) oldP.removeAttribute('id');
+  }
+
+  switch (msg.type) {
+    case 'progress':
+      const cProg = document.getElementById('console');
+      let pEl = document.getElementById('curr-progress');
+      if (!pEl) {
+        pEl = document.createElement('div');
+        pEl.id = 'curr-progress';
+        pEl.className = 'log-progress';
+        pEl.style.color = '#10b981'; // 녹색
+        cProg.appendChild(pEl);
+      }
+      pEl.textContent = msg.msg;
+      break;
+
+    case 'log':
+      const cls = msg.msg.includes('❌') ? 'error'
+                : msg.msg.includes('✅') ? 'success'
+                : msg.msg.includes('⏭')  ? 'warn'
+                : 'info';
+      logMsg(msg.msg, cls);
+      break;
+
+    case 'file_start':
+      // 해당 파일 아이템 표시
+      const idx = allFiles.findIndex(f => f.path === msg.path);
+      if (idx >= 0) markFile(idx, 'processing');
+      logMsg(`\n[${msg.idx}/${msg.total}] 📄 ${msg.name}`, 'file');
+      break;
+
+    case 'file_done':
+      const idx2 = allFiles.findIndex(f => f.name === msg.name);
+      if (idx2 >= 0) {
+        markFile(idx2, msg.skipped ? 'complete' : 'complete');
+        allFiles[idx2].done = true;
+        // 배지 갱신
+        const si = document.getElementById(`fi-${idx2}`);
+        if (si) si.querySelector('.file-status').innerHTML = '<span class="txt-badge">TXT</span>';
+      }
+      doneFiles++;
+      updateProgress(doneFiles, totalFiles);
+      if (msg.preview) logMsg(`  미리보기: "${msg.preview.trim().substring(0,80)}..."`, 'info');
+      break;
+
+    case 'file_error':
+      const idx3 = allFiles.findIndex(f => f.name === msg.name);
+      if (idx3 >= 0) markFile(idx3, 'error');
+      break;
+
+    case 'done':
+      logMsg('\n🎉 ' + msg.msg, 'done');
+      break;
+
+    case 'cancelled':
+      logMsg('\n⏹ ' + msg.msg, 'warn');
+      break;
+
+    case 'error':
+      logMsg('❌ ' + msg.msg, 'error');
+      break;
+  }
+
+  // 콘솔 자동 스크롤
+  const c = document.getElementById('console');
+  c.scrollTop = c.scrollHeight;
+}
+
+function markFile(idx, status) {
+  const el = document.getElementById(`fi-${idx}`);
+  if (!el) return;
+  el.className = `file-item ${status}`;
+}
+
+// ─────────────────────────────
+// 중지
+// ─────────────────────────────
+async function stopTranscribe() {
+  await fetch('/api/cancel', { method: 'POST' });
+  if (ws) ws.close();
+  logMsg('⏹ 중지 요청됨', 'warn');
+}
+
+// ─────────────────────────────
+// UI 상태
+// ─────────────────────────────
+function setRunning(running) {
+  document.getElementById('btnStart').style.display = running ? 'none' : '';
+  document.getElementById('btnStop').style.display  = running ? '' : 'none';
+  if (!running) document.getElementById('progressText').textContent = '';
+}
+
+function updateProgress(done, total) {
+  const pct = total ? Math.round(done / total * 100) : 0;
+  document.getElementById('progressBar').style.width = pct + '%';
+  document.getElementById('progressText').textContent = total ? `${done} / ${total} (${pct}%)` : '';
+}
+
+// ─────────────────────────────
+// 콘솔
+// ─────────────────────────────
+function logMsg(text, cls='info') {
+  const c = document.getElementById('console');
+  const span = document.createElement('div');
+  span.className = `log-${cls}`;
+  span.textContent = text;
+  c.appendChild(span);
+  c.scrollTop = c.scrollHeight;
+}
+
+function clearConsole() {
+  document.getElementById('console').innerHTML = '';
+}
+
+// ─────────────────────────────
+// Enter 키로 스캔
+// ─────────────────────────────
+document.getElementById('folderPath').addEventListener('keydown', e => {
+  if (e.key === 'Enter') scanFolder();
+});
+
+// 초기 자동 스캔
+window.addEventListener('load', () => scanFolder());
+</script>
+</body>
+</html>
