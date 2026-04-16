@@ -88,13 +88,15 @@ class AudioActivityReport:
 def build_transcribe_options(
     *,
     language: str,
-    fp16: bool,
     clip_timestamps: Iterable[float] | None = None,
 ) -> dict[str, Any]:
+    """faster-whisper의 WhisperModel.transcribe 인자 딕셔너리를 만든다.
+
+    compute dtype(float16/int8_float16 등)은 WhisperModel 생성자 인자이지
+    transcribe 인자가 아니므로 여기서는 다루지 않는다.
+    """
     options: dict[str, Any] = {
         "language": language if language != "auto" else None,
-        "fp16": fp16,
-        "verbose": False,
         # Disabling prompt carry reduces repetition loops on long files.
         "condition_on_previous_text": False,
         "no_speech_threshold": 0.6,

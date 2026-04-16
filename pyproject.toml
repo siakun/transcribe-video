@@ -5,9 +5,8 @@ description = "Local Whisper-based video transcription tools and FastAPI server.
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "fastapi==0.115.12",
-  "openai-whisper==20250625",
+  "faster-whisper==1.2.1",
   "torch==2.11.0",
-  "triton-windows==3.6.0.post26 ; platform_system == 'Windows'",
   "uvicorn[standard]==0.34.2",
 ]
 

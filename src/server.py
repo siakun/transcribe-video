@@ -1,5 +1,5 @@
 """
-FastAPI 서버 - Whisper 음성인식 + 실시간 WebSocket 스트리밍
+FastAPI 서버 - faster-whisper 음성인식 + 실시간 WebSocket 스트리밍
 실행: python src/server.py
 """
 
@@ -8,15 +8,12 @@ import sys
 import re
 import asyncio
 import threading
-import queue
-import subprocess
-import contextlib
 import logging
 import tempfile
 import faulthandler
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, TextIO
+from typing import Any, TextIO
 
 from audio_activity import (
     analyze_audio_activity,
@@ -35,31 +32,6 @@ from runtime_paths import (
 APP_NAME = "whisper_server"
 IS_FROZEN = is_frozen()
 LOG_TIMESTAMP_FORMAT = "%Y/%m/%d %H:%M:%S"
-
-
-def _point_cuda_path_at_bundled_triton() -> None:
-    """Frozen 빌드에서 triton-windows가 번들된 ptxas/cuda.h/cuda.lib를 찾게 한다.
-
-    triton-windows의 find_cuda_bundled는 sysconfig.get_paths()["platlib"] 아래
-    triton/backends/nvidia 를 기준으로 동작하는데, PyInstaller onedir 빌드에서
-    platlib는 _internal 을 가리키지 않아 "Failed to find CUDA" 경고가 난다.
-    번들에는 해당 파일들이 _MEIPASS/triton/backends/nvidia 에 제대로 들어가
-    있으므로, 사용자가 CUDA_PATH 를 따로 지정한 게 아니라면 이 경로로 설정해
-    find_cuda_env 가 맨 먼저 해석되게 한다.
-    """
-    if not IS_FROZEN:
-        return
-    if os.environ.get("CUDA_PATH") or os.environ.get("CUDA_HOME"):
-        return
-    meipass = getattr(sys, "_MEIPASS", None)
-    if not meipass:
-        return
-    candidate = Path(meipass) / "triton" / "backends" / "nvidia"
-    if (candidate / "bin" / "ptxas.exe").exists():
-        os.environ["CUDA_PATH"] = str(candidate)
-
-
-_point_cuda_path_at_bundled_triton()
 
 
 def _open_log_stream() -> tuple[Path, TextIO]:
@@ -163,7 +135,6 @@ _install_diagnostic_hooks()
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 app = FastAPI(title="Whisper 음성인식 서버")
@@ -184,7 +155,6 @@ async def log_shutdown():
 # ─────────────────────────────────────────────
 is_running = False
 cancel_flag = threading.Event()
-ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 # ─────────────────────────────────────────────
@@ -245,117 +215,113 @@ async def cancel():
 
 
 # ─────────────────────────────────────────────
-# WebSocket 로깅용 스트림
+# 전사 도우미
 # ─────────────────────────────────────────────
-class WsStream:
-    def __init__(self, relay):
-        self.relay = relay
-        self.buf = ""
+def _format_hms(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
-    def write(self, s):
-        # relay로 가는 경로가 우선이다. 서버 콘솔 미러링(sys.__stderr__)
-        # 이나 raw 로그 파일 기록이 어떤 이유로 예외를 던지더라도 웹 UI로
-        # 가는 progress 전달이 중단되지 않도록 먼저 buf를 소비한다.
-        self.buf += s
-        while "\r" in self.buf or "\n" in self.buf:
-            idx_r = self.buf.find("\r")
-            idx_n = self.buf.find("\n")
 
-            if idx_r != -1 and (idx_n == -1 or idx_r < idx_n):
-                line = self.buf[:idx_r]
-                self.buf = self.buf[idx_r+1:]
-            else:
-                line = self.buf[:idx_n]
-                self.buf = self.buf[idx_n+1:]
+async def _run_transcribe_with_progress(
+    wmodel,
+    audio_path: Path,
+    activity,
+    language: str,
+    loop: asyncio.AbstractEventLoop,
+    websocket: WebSocket,
+) -> dict:
+    """faster-whisper의 transcribe는 (segments_generator, info) 튜플을 반환하고
+    generator 반복이 실제 추론을 트리거한다. generator를 별도 스레드에서
+    돌리며 각 Segment 도착 시점에 asyncio.Queue를 통해 메인 코루틴에 넘겨
+    곧바로 WebSocket으로 progress 메시지를 전송한다. 결과는
+    normalize_transcription_result가 기대하는 dict 형태로 돌려준다.
 
-            self.relay.push(line)
+    기존 openai-whisper 경로와 달리 tqdm stderr 캡처가 필요 없어서
+    WsStream/ProgressRelay/pump_progress 구조 전체가 제거됐다.
+    """
+    q: asyncio.Queue = asyncio.Queue()
+    TAG_INFO = "info"
+    TAG_SEG = "segment"
+    TAG_DONE = "done"
+    TAG_ERR = "error"
 
-        # 보조적인 터미널 미러링과 raw 로그 기록은 best-effort로 돌린다.
+    clip_timestamps = activity.effective_clip_timestamps()
+    options = build_transcribe_options(
+        language=language,
+        clip_timestamps=clip_timestamps,
+    )
+
+    def worker():
         try:
-            if sys.__stderr__ is not None:
-                sys.__stderr__.write(s)
-                sys.__stderr__.flush()
-        except Exception:
-            pass
-        try:
-            _append_raw_log_text(s)
-        except Exception:
-            pass
+            segments_gen, info = wmodel.transcribe(str(audio_path), **options)
+            loop.call_soon_threadsafe(q.put_nowait, (TAG_INFO, info))
+            for seg in segments_gen:
+                loop.call_soon_threadsafe(q.put_nowait, (TAG_SEG, seg))
+            loop.call_soon_threadsafe(q.put_nowait, (TAG_DONE, None))
+        except Exception as e:
+            loop.call_soon_threadsafe(q.put_nowait, (TAG_ERR, e))
 
-    def flush(self):
-        # 버퍼에 남은 꼬리(주로 tqdm의 마지막 프레임)를 relay에 흘려보내면
-        # transcribe가 끝난 뒤 done 이후에 뒤늦은 progress가 튀어나와 UI가
-        # "진행중"처럼 보이게 된다. 원본 stderr와 raw 로그에는 이미 기록되어
-        # 있으므로 여기서는 relay에는 밀지 않고 버퍼만 비운다.
-        sys.__stderr__.flush()
-        self.buf = ""
-        _flush_log_stream()
+    fut = loop.run_in_executor(None, worker)
 
-
-class ProgressRelay:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.latest: Optional[str] = None
-        self.closed = False
-        self.push_count = 0  # 진단용: push 단계가 아예 호출되지 않는 경로를 가려내기 위한 카운터
-
-    def push(self, line: str):
-        clean = ANSI_ESCAPE_RE.sub("", line).strip()
-        if not clean or clean.startswith("warnings.warn"):
-            return
-        with self.lock:
-            self.latest = clean
-            self.push_count += 1
-            should_log = self.push_count == 1 or self.push_count % 50 == 0
-        if should_log:
-            LOGGER.info("relay.push 누적: %d건", self.push_count)
-
-    def pop_latest(self) -> Optional[str]:
-        with self.lock:
-            line = self.latest
-            self.latest = None
-            return line
-
-    def has_pending(self) -> bool:
-        with self.lock:
-            return self.latest is not None
-
-    def close(self):
-        with self.lock:
-            self.closed = True
-
-    def is_closed(self) -> bool:
-        with self.lock:
-            return self.closed
-
-
-async def pump_progress(relay: ProgressRelay, websocket: WebSocket):
-    # progress 파이프(WsStream → relay → pump → WS)가 어디서 끊기는지 진단하기
-    # 위한 카운터. 세션 종료 자리에 단 한 줄만 찍어 빈도 노이즈 없이 "서버가
-    # 몇 개나 송출했는가"를 드러낸다. 0이면 서버 측 capture가 못 된 것이고,
-    # N>0인데 UI에 안 보이면 클라이언트 렌더링 쪽 문제다.
-    last_sent = None
-    sent_count = 0
+    collected: list[dict] = []
+    info_obj = None
     try:
-        while not relay.is_closed() or relay.has_pending():
-            line = relay.pop_latest()
-            if line and line != last_sent:
-                await websocket.send_json({"type": "progress", "msg": line})
-                last_sent = line
-                sent_count += 1
-                if sent_count == 1 or sent_count % 50 == 0:
-                    LOGGER.info("pump.send 누적: %d건", sent_count)
-            else:
-                await asyncio.sleep(0.12)
-    except Exception:
-        LOGGER.exception("Progress relay failed")
-        relay.close()
+        while True:
+            tag, payload = await q.get()
+            if tag == TAG_ERR:
+                raise payload
+            if tag == TAG_DONE:
+                break
+            if tag == TAG_INFO:
+                info_obj = payload
+                continue
+            # TAG_SEG
+            seg = payload
+            seg_dict: dict[str, Any] = {
+                "start": float(seg.start),
+                "end": float(seg.end),
+                "text": seg.text,
+                "avg_logprob": float(seg.avg_logprob),
+                "no_speech_prob": float(seg.no_speech_prob),
+                "compression_ratio": float(seg.compression_ratio),
+            }
+            words = getattr(seg, "words", None)
+            if words:
+                seg_dict["words"] = [
+                    {
+                        "start": float(w.start),
+                        "end": float(w.end),
+                        "word": w.word,
+                        "probability": float(w.probability),
+                    }
+                    for w in words
+                ]
+            collected.append(seg_dict)
+
+            if info_obj and info_obj.duration and info_obj.duration > 0:
+                total = float(info_obj.duration)
+                cur = float(seg.end)
+                pct = min(100.0, cur / total * 100.0)
+                msg = f"{pct:5.1f}% | {_format_hms(cur)} / {_format_hms(total)}"
+                try:
+                    await websocket.send_json({"type": "progress", "msg": msg})
+                except Exception:
+                    # WebSocket이 중간에 닫혀도 전사 자체는 끝까지 간다.
+                    pass
     finally:
-        LOGGER.info(
-            "progress 송출 요약: push=%d건, send=%d건",
-            relay.push_count,
-            sent_count,
-        )
+        try:
+            await fut
+        except Exception:
+            pass
+
+    return normalize_transcription_result({
+        "segments": collected,
+        "text": "",
+        "language": info_obj.language if info_obj else language,
+    })
 
 
 # ─────────────────────────────────────────────
@@ -365,13 +331,11 @@ async def pump_progress(relay: ProgressRelay, websocket: WebSocket):
 async def ws_transcribe(websocket: WebSocket):
     global is_running
     await websocket.accept()
-    progress_relay = ProgressRelay()
-    progress_task = asyncio.create_task(pump_progress(progress_relay, websocket))
 
     try:
         data = await websocket.receive_json()
         files: list[str] = data.get("files", [])
-        model: str = data.get("model", "turbo")
+        model_name: str = data.get("model", "turbo")
         language: str = data.get("language", "ko")
         make_srt: bool = data.get("srt", True)
 
@@ -388,32 +352,34 @@ async def ws_transcribe(websocket: WebSocket):
 
         await websocket.send_json({"type": "start", "total": len(files)})
 
-        # 모델 로딩 (한 번만)
-        await websocket.send_json({"type": "log", "msg": f"[모델 로딩] whisper {model} 로딩 중..."})
+        await websocket.send_json({
+            "type": "log",
+            "msg": f"[모델 로딩] faster-whisper {model_name} 로딩 중...",
+        })
 
-        import whisper
+        from faster_whisper import WhisperModel
         import torch
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else "CPU"
-        await websocket.send_json({"type": "log", "msg": f"[GPU] {gpu_name} 사용"})
+        if torch.cuda.is_available():
+            device = "cuda"
+            gpu_name = torch.cuda.get_device_name(0)
+            compute_type = "float16"
+        else:
+            device = "cpu"
+            gpu_name = "CPU"
+            compute_type = "int8"
 
-        # 별도 스레드에서 모델 로딩 (블로킹 방지). whisper.load_model은 캐시가
-        # 없으면 OpenAI CDN에서 모델을 받아오면서 tqdm을 stderr에 찍는데,
-        # 전사 때 쓰는 것과 같은 WsStream/progress_relay 경로로 묶으면 그
-        # 다운로드 진행률이 UI의 progress 줄에 그대로 나타난다.
+        await websocket.send_json({
+            "type": "log",
+            "msg": f"[GPU] {gpu_name} 사용 (compute_type={compute_type})",
+        })
+
         loop = asyncio.get_event_loop()
-
-        def do_load_model():
-            stream = WsStream(progress_relay)
-            with contextlib.redirect_stderr(stream), contextlib.redirect_stdout(stream):
-                try:
-                    return whisper.load_model(model, device=device)
-                finally:
-                    stream.flush()
-
-        wmodel = await loop.run_in_executor(None, do_load_model)
-        await websocket.send_json({"type": "log", "msg": f"[모델 로딩] 완료 ✓"})
+        wmodel = await loop.run_in_executor(
+            None,
+            lambda: WhisperModel(model_name, device=device, compute_type=compute_type),
+        )
+        await websocket.send_json({"type": "log", "msg": "[모델 로딩] 완료 ✓"})
 
         import time
 
@@ -453,7 +419,7 @@ async def ws_transcribe(websocket: WebSocket):
                         stderr=asyncio.subprocess.PIPE,
                     )
                     _, stderr = await proc.communicate()
-                    
+
                     if proc.returncode != 0:
                         await websocket.send_json({"type": "log", "msg": f"  ❌ ffmpeg 오류: {stderr.decode(errors='replace')[-300:]}"})
                         await websocket.send_json({"type": "file_error", "idx": idx, "name": p.name})
@@ -506,27 +472,13 @@ async def ws_transcribe(websocket: WebSocket):
                 })
                 continue
 
-            await websocket.send_json({"type": "log", "msg": f"  🤖 음성 인식 중... (모델: {model})"})
+            await websocket.send_json({"type": "log", "msg": f"  🤖 음성 인식 중... (모델: {model_name})"})
             t0 = time.time()
 
-            # 블로킹 인식 → executor에서 실행
-            def do_transcribe():
-                stream = WsStream(progress_relay)
-                with contextlib.redirect_stderr(stream), contextlib.redirect_stdout(stream):
-                    try:
-                        return wmodel.transcribe(
-                            str(audio_path),
-                            **build_transcribe_options(
-                                language=language,
-                                fp16=(device == "cuda"),
-                                clip_timestamps=activity.effective_clip_timestamps(),
-                            ),
-                        )
-                    finally:
-                        stream.flush()
-
             try:
-                result = normalize_transcription_result(await loop.run_in_executor(None, do_transcribe))
+                result = await _run_transcribe_with_progress(
+                    wmodel, audio_path, activity, language, loop, websocket,
+                )
             except Exception as e:
                 LOGGER.exception("Transcription failed for %s", p)
                 await websocket.send_json({"type": "log", "msg": f"  ❌ 인식 오류: {e}"})
@@ -537,10 +489,6 @@ async def ws_transcribe(websocket: WebSocket):
 
             elapsed = round(time.time() - t0)
             detected = result.get("language", "?")
-            # Whisper tqdm은 clip_timestamps가 음성 구간만 커버하면 100%에 못
-            # 닿은 채 leave=True로 마지막 프레임이 서버 콘솔에 박혀 있어서,
-            # 전사가 끝난 뒤에도 화면상 "진행중"처럼 보인다. 서버 측 로그를
-            # 한 줄 찍어 커서를 tqdm 다음 줄로 밀어내고 완료를 명시한다.
             LOGGER.info("전사 완료: %s (%d초, 언어=%s)", p.name, elapsed, detected)
 
             # 텍스트 저장
@@ -593,8 +541,6 @@ async def ws_transcribe(websocket: WebSocket):
     finally:
         is_running = False
         cancel_flag.clear()
-        progress_relay.close()
-        await progress_task
 
 
 # ─────────────────────────────────────────────

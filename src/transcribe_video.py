@@ -1,7 +1,6 @@
 """
 동영상 음성 → 텍스트 변환 스크립트
-  - openai-whisper 로컬 실행 (인터넷/API 키 불필요, 완전 무료)
-  - RTX 5080 최적화 (FP16, GPU 가속)
+  - faster-whisper (CTranslate2) 로컬 실행, GPU 가속
   - 단일 파일 또는 폴더 전체 배치 처리 지원
   - 중단 후 이어서 처리 가능 (이미 완료된 파일 건너뜀)
 
@@ -68,20 +67,49 @@ def extract_audio(video_path: Path, audio_path: Path) -> bool:
     return True
 
 
-def transcribe(audio_path: Path, model, language: str, fp16: bool) -> tuple[dict, object]:
-    """Whisper로 음성 인식 수행"""
+def transcribe(audio_path: Path, model, language: str) -> tuple[dict, object]:
+    """faster-whisper로 음성 인식 수행. segments는 generator라 iteration이
+    실제 추론을 트리거한다. 여기서는 한 번에 전부 소비해 dict 리스트로 모은다."""
     activity = analyze_audio_activity(audio_path)
     if not activity.regions:
         return empty_transcription_result(language), activity
 
-    result = model.transcribe(
+    segments_gen, info = model.transcribe(
         str(audio_path),
         **build_transcribe_options(
             language=language,
-            fp16=fp16,
             clip_timestamps=activity.effective_clip_timestamps(),
         ),
     )
+
+    collected: list[dict] = []
+    for seg in segments_gen:
+        seg_dict = {
+            "start": float(seg.start),
+            "end": float(seg.end),
+            "text": seg.text,
+            "avg_logprob": float(seg.avg_logprob),
+            "no_speech_prob": float(seg.no_speech_prob),
+            "compression_ratio": float(seg.compression_ratio),
+        }
+        words = getattr(seg, "words", None)
+        if words:
+            seg_dict["words"] = [
+                {
+                    "start": float(w.start),
+                    "end": float(w.end),
+                    "word": w.word,
+                    "probability": float(w.probability),
+                }
+                for w in words
+            ]
+        collected.append(seg_dict)
+
+    result = {
+        "segments": collected,
+        "text": "",
+        "language": info.language if info else language,
+    }
     return normalize_transcription_result(result), activity
 
 
@@ -113,7 +141,6 @@ def process_single_file(
     video_path: Path,
     model,
     language: str,
-    fp16: bool,
     output_dir: Path | None,
     save_srt_flag: bool,
     keep_audio: bool,
@@ -140,7 +167,7 @@ def process_single_file(
     print(f"  🔎 음성 구간 분석 중...")
     print(f"  🤖 음성 인식 중...")
     try:
-        result, activity = transcribe(audio_path, model, language, fp16)
+        result, activity = transcribe(audio_path, model, language)
     except Exception as e:
         print(f"  ❌ 인식 오류: {e}")
         if audio_path.exists():
@@ -266,21 +293,23 @@ def main():
     print(f"   파일: {len(videos)}개")
     print("=" * 60)
 
-    import whisper
+    from faster_whisper import WhisperModel
     import torch
 
     if not torch.cuda.is_available():
         print("⚠️  GPU를 찾을 수 없습니다. CPU로 실행합니다 (매우 느림).")
         print("   CUDA 설치 여부를 확인하세요: https://developer.nvidia.com/cuda-downloads")
         device = "cpu"
+        compute_type = "int8"
     else:
         gpu_name = torch.cuda.get_device_name(0)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
         print(f"✅ GPU: {gpu_name} ({vram_gb:.1f}GB VRAM)")
         device = "cuda"
+        compute_type = "float16"
 
-    print(f"\n📥 모델 로딩 중: {args.model} (첫 실행 시 다운로드)")
-    model = whisper.load_model(args.model, device=device)
+    print(f"\n📥 모델 로딩 중: {args.model} (첫 실행 시 다운로드, compute_type={compute_type})")
+    model = WhisperModel(args.model, device=device, compute_type=compute_type)
     print("✅ 모델 로딩 완료\n")
 
     # ─────────────────────────────────────────────
@@ -296,7 +325,6 @@ def main():
             video_path=video_path,
             model=model,
             language=args.language,
-            fp16=(device == "cuda"),
             output_dir=output_dir,
             save_srt_flag=args.srt,
             keep_audio=args.keep_audio,

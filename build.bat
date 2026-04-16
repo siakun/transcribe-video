@@ -52,7 +52,7 @@ if not exist "%PYTHON_EXE%" (
   set "PYTHON_EXE=python"
 )
 
-%PYTHON_EXE% -c "import fastapi, uvicorn, whisper, torch" >nul 2>nul
+%PYTHON_EXE% -c "import fastapi, uvicorn, faster_whisper, torch" >nul 2>nul
 if errorlevel 1 (
   call :log [ERROR] Required runtime packages are missing in this Python environment.
   call :log         Install the project dependencies first, then run this file again.
@@ -85,19 +85,6 @@ if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
 if not exist "%SPEC_DIR%" mkdir "%SPEC_DIR%"
 if not exist "%WORK_DIR%" mkdir "%WORK_DIR%"
 
-rem whisper/triton_ops.py needs its .py source at runtime because @triton.jit
-rem reads the function source via inspect.getsourcefile; a .pyc-only bundle
-rem raises "@jit functions should be defined in a Python file".
-for /f "delims=" %%i in ('%PYTHON_EXE% -c "import whisper, os; print(os.path.dirname(whisper.__file__))"') do set "WHISPER_DIR=%%i"
-if not defined WHISPER_DIR (
-  call :log [ERROR] Could not resolve whisper package directory via %PYTHON_EXE%.
-  goto :error_exit
-)
-if not exist "%WHISPER_DIR%\triton_ops.py" (
-  call :log [ERROR] whisper\triton_ops.py not found under %WHISPER_DIR%.
-  goto :error_exit
-)
-
 call :log [1/2] Building %APP_NAME%.exe ...
 call :log         Build log: %CD%\%BUILD_LOG%
 >> "%BUILD_LOG%" echo [PyInstaller]
@@ -113,13 +100,12 @@ call :log         Build log: %CD%\%BUILD_LOG%
   --specpath "%SPEC_DIR%" ^
   --workpath "%WORK_DIR%" ^
   --add-data "%INDEX_HTML_ABS%;." ^
-  --add-data "%WHISPER_DIR%\triton_ops.py;whisper" ^
-  --collect-submodules whisper ^
-  --collect-data whisper ^
-  --collect-all triton ^
-  --collect-submodules tiktoken ^
-  --collect-submodules tiktoken_ext ^
-  --collect-data tiktoken ^
+  --collect-all faster_whisper ^
+  --collect-all ctranslate2 ^
+  --collect-all huggingface_hub ^
+  --collect-all tokenizers ^
+  --collect-all onnxruntime ^
+  --collect-all av ^
   --collect-submodules fastapi ^
   --collect-submodules starlette ^
   --collect-submodules anyio ^
@@ -130,7 +116,6 @@ call :log         Build log: %CD%\%BUILD_LOG%
   --collect-data uvicorn ^
   --collect-binaries torch ^
   --collect-data torch ^
-  --hidden-import=tiktoken_ext.openai_public ^
   --hidden-import=uvicorn.logging ^
   --hidden-import=uvicorn.loops.auto ^
   --hidden-import=uvicorn.protocols.http.auto ^
