@@ -12,6 +12,11 @@ MIN_SPEECH_REGION_SEC = 1.0
 MERGE_GAP_SEC = 0.75
 REGION_PADDING_SEC = 0.5
 MIN_PARTIAL_WINDOW_RATIO = 0.35
+# Whisper의 clip_timestamps가 content_frames를 넘으면 무한 루프가 발생하므로
+# 마지막 region end를 오디오 끝에서 이 시간만큼 당겨둔다.
+CLIP_SAFETY_MARGIN_SEC = 0.05
+# 음성이 대부분이면 clip_timestamps로 얻는 이득이 없고 엣지케이스만 키우므로 생략한다.
+CLIP_COVERAGE_SKIP_THRESHOLD = 0.95
 
 
 @dataclass(frozen=True)
@@ -55,6 +60,29 @@ class AudioActivityReport:
         for region in self.regions:
             timestamps.extend([round(region.start_sec, 3), round(region.end_sec, 3)])
         return timestamps
+
+    @property
+    def speech_coverage(self) -> float:
+        if self.duration_sec <= 0:
+            return 0.0
+        return self.speech_duration_sec / self.duration_sec
+
+    def effective_clip_timestamps(
+        self,
+        *,
+        coverage_skip_threshold: float = CLIP_COVERAGE_SKIP_THRESHOLD,
+    ) -> list[float] | None:
+        """Whisper에 안전하게 넘길 수 있는 clip_timestamps.
+
+        - 음성이 전혀 없으면 None.
+        - 음성이 거의 전부를 덮으면 None (clip 없이 전체 처리).
+        - 그 외에는 region 목록을 그대로 반환한다.
+        """
+        if not self.regions:
+            return None
+        if self.speech_coverage >= coverage_skip_threshold:
+            return None
+        return self.clip_timestamps
 
 
 def build_transcribe_options(
@@ -249,6 +277,7 @@ def analyze_audio_activity(
         padding_windows=padding_windows,
         total_windows=db.size,
         window_sec=window_sec,
+        duration_sec=duration_sec,
         activity_threshold_db=activity_threshold_db,
     )
 
@@ -336,6 +365,7 @@ def _finalize_regions(
     padding_windows: int,
     total_windows: int,
     window_sec: float,
+    duration_sec: float,
     activity_threshold_db: float,
 ) -> list[AudioRegion]:
     kept: list[tuple[int, int]] = []
@@ -371,10 +401,17 @@ def _finalize_regions(
         else:
             merged.append((start, end))
 
-    return [
-        AudioRegion(
-            start_sec=round(start * window_sec, 3),
-            end_sec=round(end * window_sec, 3),
+    max_sec = max(0.0, duration_sec - CLIP_SAFETY_MARGIN_SEC)
+    finalized: list[AudioRegion] = []
+    for start, end in merged:
+        start_sec = min(start * window_sec, max_sec)
+        end_sec = min(end * window_sec, max_sec)
+        if end_sec - start_sec < window_sec:
+            continue
+        finalized.append(
+            AudioRegion(
+                start_sec=round(start_sec, 3),
+                end_sec=round(end_sec, 3),
+            )
         )
-        for start, end in merged
-    ]
+    return finalized

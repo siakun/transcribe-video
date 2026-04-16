@@ -452,7 +452,7 @@ async def ws_transcribe(websocket: WebSocket):
                             **build_transcribe_options(
                                 language=language,
                                 fp16=(device == "cuda"),
-                                clip_timestamps=activity.clip_timestamps,
+                                clip_timestamps=activity.effective_clip_timestamps(),
                             ),
                         )
                     finally:

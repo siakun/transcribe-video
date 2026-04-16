@@ -79,7 +79,7 @@ def transcribe(audio_path: Path, model, language: str, fp16: bool) -> tuple[dict
         **build_transcribe_options(
             language=language,
             fp16=fp16,
-            clip_timestamps=activity.clip_timestamps,
+            clip_timestamps=activity.effective_clip_timestamps(),
         ),
     )
     return normalize_transcription_result(result), activity
