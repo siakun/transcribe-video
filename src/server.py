@@ -11,8 +11,132 @@ import threading
 import queue
 import subprocess
 import contextlib
+import logging
+import tempfile
+import faulthandler
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TextIO
+
+APP_NAME = "whisper_server"
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+LOG_TIMESTAMP_FORMAT = "%Y/%m/%d %H:%M:%S"
+
+
+def _runtime_base_dir() -> Path:
+    if IS_FROZEN:
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _open_log_stream() -> tuple[Path, TextIO]:
+    candidate_dirs = [_runtime_base_dir() / "logs"]
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        candidate_dirs.append(Path(local_appdata) / "transcribe-video" / "logs")
+    candidate_dirs.append(Path(tempfile.gettempdir()) / "transcribe-video" / "logs")
+
+    for log_dir in candidate_dirs:
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / f"{APP_NAME}.log"
+            return log_path, log_path.open("a", encoding="utf-8", buffering=1)
+        except OSError:
+            continue
+
+    fallback_path = Path(tempfile.gettempdir()) / f"{APP_NAME}.log"
+    return fallback_path, fallback_path.open("a", encoding="utf-8", buffering=1)
+
+
+LOG_FILE_PATH, LOG_FILE_STREAM = _open_log_stream()
+
+
+def _append_raw_log_text(text: str) -> None:
+    if not text:
+        return
+    try:
+        LOG_FILE_STREAM.write(text)
+        LOG_FILE_STREAM.flush()
+    except Exception:
+        pass
+
+
+def _flush_log_stream() -> None:
+    try:
+        LOG_FILE_STREAM.flush()
+    except Exception:
+        pass
+
+
+def _configure_logging() -> logging.Logger:
+    _append_raw_log_text(
+        "\n"
+        + ("=" * 72)
+        + "\n"
+        + f"{datetime.now().strftime(LOG_TIMESTAMP_FORMAT)} pid={os.getpid()} frozen={IS_FROZEN}\n"
+        + f"argv={sys.argv!r}\n"
+    )
+
+    handlers: list[logging.Handler] = [logging.StreamHandler(LOG_FILE_STREAM)]
+    if sys.__stderr__ is not None:
+        handlers.insert(0, logging.StreamHandler(sys.__stderr__))
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt=LOG_TIMESTAMP_FORMAT,
+        handlers=handlers,
+        force=True,
+    )
+
+    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        uvicorn_logger = logging.getLogger(logger_name)
+        uvicorn_logger.handlers.clear()
+        uvicorn_logger.propagate = True
+
+    logger = logging.getLogger(APP_NAME)
+    logger.info("Logging initialized")
+    logger.info("Log file: %s", LOG_FILE_PATH)
+    logger.info("Base directory: %s", _runtime_base_dir())
+    return logger
+
+
+LOGGER = _configure_logging()
+
+
+def _install_diagnostic_hooks() -> None:
+    try:
+        faulthandler.enable(LOG_FILE_STREAM, all_threads=True)
+    except Exception:
+        LOGGER.warning("faulthandler could not be enabled", exc_info=True)
+
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        LOGGER.critical(
+            "Unhandled exception",
+            exc_info=(exc_type, exc_value, exc_traceback),
+        )
+        _flush_log_stream()
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+    def handle_thread_exception(args):
+        if args.exc_type is None or issubclass(args.exc_type, KeyboardInterrupt):
+            return
+        thread_name = args.thread.name if args.thread else "unknown"
+        LOGGER.critical(
+            "Unhandled exception in thread %s",
+            thread_name,
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+        _flush_log_stream()
+
+    sys.excepthook = handle_exception
+    threading.excepthook = handle_thread_exception
+
+
+_install_diagnostic_hooks()
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -20,6 +144,17 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 app = FastAPI(title="Whisper 음성인식 서버")
+LOGGER.info("FastAPI imports completed")
+
+
+@app.on_event("startup")
+async def log_startup():
+    LOGGER.info("Application startup complete")
+
+
+@app.on_event("shutdown")
+async def log_shutdown():
+    LOGGER.info("Application shutdown complete")
 
 # ─────────────────────────────────────────────
 # 전역 상태
@@ -97,6 +232,7 @@ class WsStream:
     def write(self, s):
         sys.__stderr__.write(s)
         sys.__stderr__.flush()
+        _append_raw_log_text(s)
         self.buf += s
         while "\r" in self.buf or "\n" in self.buf:
             idx_r = self.buf.find("\r")
@@ -116,6 +252,7 @@ class WsStream:
         if self.buf:
             self.relay.push(self.buf)
             self.buf = ""
+        _flush_log_stream()
 
 
 class ProgressRelay:
@@ -161,6 +298,7 @@ async def pump_progress(relay: ProgressRelay, websocket: WebSocket):
             else:
                 await asyncio.sleep(0.12)
     except Exception:
+        LOGGER.exception("Progress relay failed")
         relay.close()
 
 
@@ -279,6 +417,7 @@ async def ws_transcribe(websocket: WebSocket):
             try:
                 result = await loop.run_in_executor(None, do_transcribe)
             except Exception as e:
+                LOGGER.exception("Transcription failed for %s", p)
                 await websocket.send_json({"type": "log", "msg": f"  ❌ 인식 오류: {e}"})
                 await websocket.send_json({"type": "file_error", "idx": idx, "name": p.name})
                 if audio_path.exists():
@@ -330,6 +469,7 @@ async def ws_transcribe(websocket: WebSocket):
     except WebSocketDisconnect:
         pass
     except Exception as e:
+        LOGGER.exception("WebSocket transcription failed")
         await websocket.send_json({"type": "error", "msg": str(e)})
     finally:
         is_running = False
@@ -342,8 +482,18 @@ async def ws_transcribe(websocket: WebSocket):
 # 실행
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
+    LOGGER.info("Starting Whisper server")
+    LOGGER.info("Open http://localhost:8765 after startup")
     print("=" * 50)
     print("  Whisper 음성인식 서버 시작")
     print("  브라우저에서 열기: http://localhost:8765")
+    print(f"  Log file: {LOG_FILE_PATH}")
     print("=" * 50)
-    uvicorn.run(app, host="0.0.0.0", port=8765, log_level="warning")
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=8765, log_level="warning", log_config=None)
+    except Exception:
+        LOGGER.exception("Server terminated during startup")
+        raise
+    finally:
+        LOGGER.info("Process exiting")
+        _flush_log_stream()

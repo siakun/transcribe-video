@@ -5,52 +5,89 @@ cd /d "%~dp0"
 
 set "APP_NAME=whisper_server"
 set "ENTRY=src\server.py"
+set "ENTRY_ABS=%CD%\src\server.py"
+set "INDEX_HTML_ABS=%CD%\src\index.html"
 set "PYTHON_EXE=.venv\Scripts\python.exe"
+set "OUTPUT_ROOT=build"
+set "TEMP_ROOT=temp"
+set "LOG_DIR=logs"
+set "BUILD_LOG=%LOG_DIR%\build.log"
+set "PAUSE_ON_EXIT=1"
+
+if /i "%~1"=="--no-pause" set "PAUSE_ON_EXIT=0"
+
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
+> "%BUILD_LOG%" echo ================================================================================
+>> "%BUILD_LOG%" echo build.bat started in %CD%
+>> "%BUILD_LOG%" echo.
+
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "BUILD_STAMP=%%i"
+set "OUTPUT_DIR=%OUTPUT_ROOT%\%BUILD_STAMP%"
+set "TEMP_DIR=%TEMP_ROOT%\%BUILD_STAMP%"
+set "SPEC_DIR=%TEMP_DIR%\spec"
+set "WORK_DIR=%TEMP_DIR%\work"
+call :log Build stamp: %BUILD_STAMP%
+call :log Output dir: %CD%\%OUTPUT_DIR%\%APP_NAME%
+call :log Temp dir: %CD%\%TEMP_DIR%
 
 if not exist "%ENTRY%" (
-  echo [ERROR] %ENTRY% not found.
-  exit /b 1
+  call :log [ERROR] %ENTRY% not found.
+  goto :error_exit
 )
 
 if not exist "src\index.html" (
-  echo [ERROR] src\index.html not found.
-  exit /b 1
+  call :log [ERROR] src\index.html not found.
+  goto :error_exit
 )
 
 if not exist "%PYTHON_EXE%" (
   where python >nul 2>nul
   if errorlevel 1 (
-    echo [ERROR] python not found in PATH and .venv is missing.
-    echo         Run these first:
-    echo         uv venv
-    echo         uv sync --group dev
-    exit /b 1
+    call :log [ERROR] python not found in PATH and .venv is missing.
+    call :log         Run these first:
+    call :log         uv venv
+    call :log         uv sync --group dev
+    goto :error_exit
   )
   set "PYTHON_EXE=python"
 )
 
 %PYTHON_EXE% -c "import fastapi, uvicorn, whisper, torch" >nul 2>nul
 if errorlevel 1 (
-  echo [ERROR] Required runtime packages are missing in this Python environment.
-  echo         Install the project dependencies first, then run this file again.
-  echo         Recommended:
-  echo         uv sync --group dev
-  exit /b 1
+  call :log [ERROR] Required runtime packages are missing in this Python environment.
+  call :log         Install the project dependencies first, then run this file again.
+  call :log         Recommended:
+  call :log         uv sync --group dev
+  goto :error_exit
 )
 
 %PYTHON_EXE% -m PyInstaller --version >nul 2>nul
 if errorlevel 1 (
-  echo [ERROR] PyInstaller is not installed in this Python environment.
-  echo         Install it with:
-  echo         uv sync --group dev
-  exit /b 1
+  call :log [ERROR] PyInstaller is not installed in this Python environment.
+  call :log         Install it with:
+  call :log         uv sync --group dev
+  goto :error_exit
 )
 
-if exist "build" rmdir /s /q "build"
 if exist "dist" rmdir /s /q "dist"
 if exist "%APP_NAME%.spec" del /q "%APP_NAME%.spec"
+if not exist "%OUTPUT_ROOT%" mkdir "%OUTPUT_ROOT%"
+if not exist "%TEMP_ROOT%" mkdir "%TEMP_ROOT%"
+if exist "%OUTPUT_DIR%" (
+  call :log [ERROR] Output directory already exists: %OUTPUT_DIR%
+  goto :error_exit
+)
+if exist "%TEMP_DIR%" (
+  call :log [ERROR] Temp directory already exists: %TEMP_DIR%
+  goto :error_exit
+)
+if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
+if not exist "%SPEC_DIR%" mkdir "%SPEC_DIR%"
+if not exist "%WORK_DIR%" mkdir "%WORK_DIR%"
 
-echo [1/2] Building %APP_NAME%.exe ...
+call :log [1/2] Building %APP_NAME%.exe ...
+call :log         Build log: %CD%\%BUILD_LOG%
+>> "%BUILD_LOG%" echo [PyInstaller]
 
 %PYTHON_EXE% -m PyInstaller ^
   --noconfirm ^
@@ -58,7 +95,10 @@ echo [1/2] Building %APP_NAME%.exe ...
   --console ^
   --onedir ^
   --name "%APP_NAME%" ^
-  --add-data "src\index.html;." ^
+  --distpath "%OUTPUT_DIR%" ^
+  --specpath "%SPEC_DIR%" ^
+  --workpath "%WORK_DIR%" ^
+  --add-data "%INDEX_HTML_ABS%;." ^
   --collect-submodules whisper ^
   --collect-data whisper ^
   --collect-submodules tiktoken ^
@@ -81,19 +121,45 @@ echo [1/2] Building %APP_NAME%.exe ...
   --hidden-import=uvicorn.protocols.websockets.auto ^
   --hidden-import=websockets.legacy.server ^
   --hidden-import=websockets.legacy.client ^
-  "%ENTRY%"
+  "%ENTRY_ABS%" >> "%BUILD_LOG%" 2>&1
 
 if errorlevel 1 (
-  echo [ERROR] Build failed.
-  exit /b 1
+  call :log [ERROR] Build failed.
+  call :log         See %CD%\%BUILD_LOG%
+  goto :error_exit
 )
 
-echo [2/2] Build complete.
-echo Output: %CD%\dist\%APP_NAME%\%APP_NAME%.exe
+call :log [2/2] Build complete.
+call :log Output: %CD%\%OUTPUT_DIR%\%APP_NAME%\%APP_NAME%.exe
 echo.
-echo Notes:
-echo   - Keep the whole dist\%APP_NAME% folder together when moving it.
-echo   - ffmpeg must be installed and available in PATH at runtime.
-echo   - The first transcription can still download a Whisper model if it is not cached yet.
+>> "%BUILD_LOG%" echo.
+> "%OUTPUT_ROOT%\latest.txt" echo %OUTPUT_DIR%\%APP_NAME%\%APP_NAME%.exe
+> "%OUTPUT_ROOT%\run_latest.bat" echo @echo off
+>> "%OUTPUT_ROOT%\run_latest.bat" echo cd /d "%%~dp0%BUILD_STAMP%\%APP_NAME%"
+>> "%OUTPUT_ROOT%\run_latest.bat" echo "%APP_NAME%.exe"
+call :log Notes:
+call :log Run: %OUTPUT_DIR%\%APP_NAME%\%APP_NAME%.exe
+call :log Latest: %OUTPUT_ROOT%\latest.txt
+call :log Launcher: %OUTPUT_ROOT%\run_latest.bat
+call :log Keep the whole %OUTPUT_DIR%\%APP_NAME% folder together when moving it.
+call :log Startup/crash logs are written to logs\%APP_NAME%.log next to the exe.
+call :log ffmpeg must be installed and available in PATH at runtime.
+call :log The first transcription can still download a Whisper model if it is not cached yet.
 
+if exist "%TEMP_DIR%" rmdir /s /q "%TEMP_DIR%"
+if exist "%TEMP_ROOT%" rd "%TEMP_ROOT%" 2>nul
+
+goto :success_exit
+
+:log
+echo %*
+>> "%BUILD_LOG%" echo %*
 exit /b 0
+
+:success_exit
+if not "%PAUSE_ON_EXIT%"=="0" pause
+exit /b 0
+
+:error_exit
+if not "%PAUSE_ON_EXIT%"=="0" pause
+exit /b 1
