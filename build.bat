@@ -89,7 +89,8 @@ call :log [1/2] Building %APP_NAME%.exe ...
 call :log         Build log: %CD%\%BUILD_LOG%
 >> "%BUILD_LOG%" echo [PyInstaller]
 
-%PYTHON_EXE% -m PyInstaller ^
+%PYTHON_EXE% "scripts\tee_runner.py" "%BUILD_LOG%" ^
+  %PYTHON_EXE% -m PyInstaller ^
   --noconfirm ^
   --clean ^
   --console ^
@@ -121,7 +122,7 @@ call :log         Build log: %CD%\%BUILD_LOG%
   --hidden-import=uvicorn.protocols.websockets.auto ^
   --hidden-import=websockets.legacy.server ^
   --hidden-import=websockets.legacy.client ^
-  "%ENTRY_ABS%" >> "%BUILD_LOG%" 2>&1
+  "%ENTRY_ABS%"
 
 if errorlevel 1 (
   call :log [ERROR] Build failed.
