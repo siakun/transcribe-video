@@ -33,6 +33,7 @@ from audio_activity import (
     format_activity_summary,
     normalize_transcription_result,
 )
+from runtime_paths import make_temp_audio_path
 
 # ─────────────────────────────────────────────
 # 모델 정보
@@ -123,7 +124,7 @@ def process_single_file(
     stem = video_path.stem
     txt_path = base_dir / f"{stem}.txt"
     srt_path = base_dir / f"{stem}.srt"
-    audio_path = base_dir / f"{stem}_temp.wav"
+    audio_path = make_temp_audio_path(video_path)
 
     # 이미 처리된 파일 건너뜀
     if txt_path.exists():

@@ -25,20 +25,13 @@ from audio_activity import (
     format_activity_summary,
     normalize_transcription_result,
 )
+from runtime_paths import make_temp_audio_path, runtime_base_dir
 
 APP_NAME = "whisper_server"
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 LOG_TIMESTAMP_FORMAT = "%Y/%m/%d %H:%M:%S"
-
-
-def _runtime_base_dir() -> Path:
-    if IS_FROZEN:
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent.parent
-
-
 def _open_log_stream() -> tuple[Path, TextIO]:
-    candidate_dirs = [_runtime_base_dir() / "logs"]
+    candidate_dirs = [runtime_base_dir() / "logs"]
     local_appdata = os.environ.get("LOCALAPPDATA")
     if local_appdata:
         candidate_dirs.append(Path(local_appdata) / "transcribe-video" / "logs")
@@ -105,7 +98,7 @@ def _configure_logging() -> logging.Logger:
     logger = logging.getLogger(APP_NAME)
     logger.info("Logging initialized")
     logger.info("Log file: %s", LOG_FILE_PATH)
-    logger.info("Base directory: %s", _runtime_base_dir())
+    logger.info("Base directory: %s", runtime_base_dir())
     return logger
 
 
@@ -379,7 +372,7 @@ async def ws_transcribe(websocket: WebSocket):
 
             # 오디오 추출
             await websocket.send_json({"type": "log", "msg": f"  🎬 오디오 추출 중..."})
-            audio_path = p.with_name(p.stem + "_temp.wav")
+            audio_path = make_temp_audio_path(p)
 
             try:
                 # ffmpeg가 한글 경로를 인식하지 못하는 버그를 피하기 위해,
