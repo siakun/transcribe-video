@@ -301,6 +301,7 @@ let allFiles = [];
 let ws = null;
 let totalFiles = 0;
 let doneFiles  = 0;
+let sessionFinished = false;
 
 // ─────────────────────────────
 // 폴더 스캔
@@ -391,6 +392,7 @@ function startTranscribe() {
 
   totalFiles = files.length;
   doneFiles  = 0;
+  sessionFinished = false;
   updateProgress(0, totalFiles);
 
   setRunning(true);
@@ -420,6 +422,9 @@ function startTranscribe() {
 }
 
 function handleMessage(msg) {
+  // 종료된 세션에서 뒤늦게 도착하는 tqdm 잔여 progress는 무시한다.
+  if (sessionFinished && msg.type === 'progress') return;
+
   // progress가 아닌 다른 로그가 오면 기존 진행바의 id를 제거하여 줄바꿈되게 함
   if (msg.type !== 'progress') {
     const oldP = document.getElementById('curr-progress');
@@ -476,14 +481,17 @@ function handleMessage(msg) {
 
     case 'done':
       logMsg('\n🎉 ' + msg.msg, 'done');
+      finishSession();
       break;
 
     case 'cancelled':
       logMsg('\n⏹ ' + msg.msg, 'warn');
+      finishSession();
       break;
 
     case 'error':
       logMsg('❌ ' + msg.msg, 'error');
+      finishSession();
       break;
   }
 
@@ -514,6 +522,20 @@ function setRunning(running) {
   document.getElementById('btnStart').style.display = running ? 'none' : '';
   document.getElementById('btnStop').style.display  = running ? '' : 'none';
   if (!running) document.getElementById('progressText').textContent = '';
+}
+
+// 서버가 done/cancelled/error를 보낸 시점에 UI를 즉시 종료 상태로 되돌린다.
+// ws.onclose를 기다리면 WebSocket 종료 지연이나 뒤늦은 progress 메시지 때문에
+// 중지 버튼이 남고 "진행중"처럼 보이는 문제가 생긴다.
+function finishSession() {
+  sessionFinished = true;
+  setRunning(false);
+  document.getElementById('statusDot').classList.remove('active');
+  const oldP = document.getElementById('curr-progress');
+  if (oldP) oldP.removeAttribute('id');
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.close(); } catch (_) {}
+  }
 }
 
 function updateProgress(done, total) {

@@ -246,10 +246,12 @@ class WsStream:
             self.relay.push(line)
 
     def flush(self):
+        # 버퍼에 남은 꼬리(주로 tqdm의 마지막 프레임)를 relay에 흘려보내면
+        # transcribe가 끝난 뒤 done 이후에 뒤늦은 progress가 튀어나와 UI가
+        # "진행중"처럼 보이게 된다. 원본 stderr와 raw 로그에는 이미 기록되어
+        # 있으므로 여기서는 relay에는 밀지 않고 버퍼만 비운다.
         sys.__stderr__.flush()
-        if self.buf:
-            self.relay.push(self.buf)
-            self.buf = ""
+        self.buf = ""
         _flush_log_stream()
 
 
