@@ -325,18 +325,26 @@ class ProgressRelay:
 
 
 async def pump_progress(relay: ProgressRelay, websocket: WebSocket):
+    # progress 파이프(WsStream → relay → pump → WS)가 어디서 끊기는지 진단하기
+    # 위한 카운터. 세션 종료 자리에 단 한 줄만 찍어 빈도 노이즈 없이 "서버가
+    # 몇 개나 송출했는가"를 드러낸다. 0이면 서버 측 capture가 못 된 것이고,
+    # N>0인데 UI에 안 보이면 클라이언트 렌더링 쪽 문제다.
     last_sent = None
+    sent_count = 0
     try:
         while not relay.is_closed() or relay.has_pending():
             line = relay.pop_latest()
             if line and line != last_sent:
                 await websocket.send_json({"type": "progress", "msg": line})
                 last_sent = line
+                sent_count += 1
             else:
                 await asyncio.sleep(0.12)
     except Exception:
         LOGGER.exception("Progress relay failed")
         relay.close()
+    finally:
+        LOGGER.info("progress 송출 요약: %d건", sent_count)
 
 
 # ─────────────────────────────────────────────
