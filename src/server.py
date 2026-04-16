@@ -25,28 +25,25 @@ from audio_activity import (
     format_activity_summary,
     normalize_transcription_result,
 )
-from runtime_paths import make_temp_audio_path, runtime_base_dir
+from runtime_paths import (
+    is_frozen,
+    make_temp_audio_path,
+    runtime_base_dir,
+    runtime_log_dir,
+)
 
 APP_NAME = "whisper_server"
-IS_FROZEN = bool(getattr(sys, "frozen", False))
+IS_FROZEN = is_frozen()
 LOG_TIMESTAMP_FORMAT = "%Y/%m/%d %H:%M:%S"
+
+
 def _open_log_stream() -> tuple[Path, TextIO]:
-    candidate_dirs = [runtime_base_dir() / "logs"]
-    local_appdata = os.environ.get("LOCALAPPDATA")
-    if local_appdata:
-        candidate_dirs.append(Path(local_appdata) / "transcribe-video" / "logs")
-    candidate_dirs.append(Path(tempfile.gettempdir()) / "transcribe-video" / "logs")
-
-    for log_dir in candidate_dirs:
-        try:
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_path = log_dir / f"{APP_NAME}.log"
-            return log_path, log_path.open("a", encoding="utf-8", buffering=1)
-        except OSError:
-            continue
-
-    fallback_path = Path(tempfile.gettempdir()) / f"{APP_NAME}.log"
-    return fallback_path, fallback_path.open("a", encoding="utf-8", buffering=1)
+    try:
+        log_path = runtime_log_dir() / f"{APP_NAME}.log"
+        return log_path, log_path.open("a", encoding="utf-8", buffering=1)
+    except OSError:
+        fallback_path = Path(tempfile.gettempdir()) / f"{APP_NAME}.log"
+        return fallback_path, fallback_path.open("a", encoding="utf-8", buffering=1)
 
 
 LOG_FILE_PATH, LOG_FILE_STREAM = _open_log_stream()
