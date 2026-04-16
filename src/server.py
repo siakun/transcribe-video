@@ -253,22 +253,34 @@ class WsStream:
         self.buf = ""
 
     def write(self, s):
-        sys.__stderr__.write(s)
-        sys.__stderr__.flush()
-        _append_raw_log_text(s)
+        # relay로 가는 경로가 우선이다. 서버 콘솔 미러링(sys.__stderr__)
+        # 이나 raw 로그 파일 기록이 어떤 이유로 예외를 던지더라도 웹 UI로
+        # 가는 progress 전달이 중단되지 않도록 먼저 buf를 소비한다.
         self.buf += s
         while "\r" in self.buf or "\n" in self.buf:
             idx_r = self.buf.find("\r")
             idx_n = self.buf.find("\n")
-            
+
             if idx_r != -1 and (idx_n == -1 or idx_r < idx_n):
                 line = self.buf[:idx_r]
                 self.buf = self.buf[idx_r+1:]
             else:
                 line = self.buf[:idx_n]
                 self.buf = self.buf[idx_n+1:]
-                
+
             self.relay.push(line)
+
+        # 보조적인 터미널 미러링과 raw 로그 기록은 best-effort로 돌린다.
+        try:
+            if sys.__stderr__ is not None:
+                sys.__stderr__.write(s)
+                sys.__stderr__.flush()
+        except Exception:
+            pass
+        try:
+            _append_raw_log_text(s)
+        except Exception:
+            pass
 
     def flush(self):
         # 버퍼에 남은 꼬리(주로 tqdm의 마지막 프레임)를 relay에 흘려보내면
