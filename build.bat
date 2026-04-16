@@ -85,6 +85,19 @@ if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
 if not exist "%SPEC_DIR%" mkdir "%SPEC_DIR%"
 if not exist "%WORK_DIR%" mkdir "%WORK_DIR%"
 
+rem whisper/triton_ops.py needs its .py source at runtime because @triton.jit
+rem reads the function source via inspect.getsourcefile; a .pyc-only bundle
+rem raises "@jit functions should be defined in a Python file".
+for /f "delims=" %%i in ('%PYTHON_EXE% -c "import whisper, os; print(os.path.dirname(whisper.__file__))"') do set "WHISPER_DIR=%%i"
+if not defined WHISPER_DIR (
+  call :log [ERROR] Could not resolve whisper package directory via %PYTHON_EXE%.
+  goto :error_exit
+)
+if not exist "%WHISPER_DIR%\triton_ops.py" (
+  call :log [ERROR] whisper\triton_ops.py not found under %WHISPER_DIR%.
+  goto :error_exit
+)
+
 call :log [1/2] Building %APP_NAME%.exe ...
 call :log         Build log: %CD%\%BUILD_LOG%
 >> "%BUILD_LOG%" echo [PyInstaller]
@@ -100,8 +113,10 @@ call :log         Build log: %CD%\%BUILD_LOG%
   --specpath "%SPEC_DIR%" ^
   --workpath "%WORK_DIR%" ^
   --add-data "%INDEX_HTML_ABS%;." ^
+  --add-data "%WHISPER_DIR%\triton_ops.py;whisper" ^
   --collect-submodules whisper ^
   --collect-data whisper ^
+  --collect-all triton ^
   --collect-submodules tiktoken ^
   --collect-submodules tiktoken_ext ^
   --collect-data tiktoken ^
