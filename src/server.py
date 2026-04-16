@@ -37,6 +37,31 @@ IS_FROZEN = is_frozen()
 LOG_TIMESTAMP_FORMAT = "%Y/%m/%d %H:%M:%S"
 
 
+def _point_cuda_path_at_bundled_triton() -> None:
+    """Frozen 빌드에서 triton-windows가 번들된 ptxas/cuda.h/cuda.lib를 찾게 한다.
+
+    triton-windows의 find_cuda_bundled는 sysconfig.get_paths()["platlib"] 아래
+    triton/backends/nvidia 를 기준으로 동작하는데, PyInstaller onedir 빌드에서
+    platlib는 _internal 을 가리키지 않아 "Failed to find CUDA" 경고가 난다.
+    번들에는 해당 파일들이 _MEIPASS/triton/backends/nvidia 에 제대로 들어가
+    있으므로, 사용자가 CUDA_PATH 를 따로 지정한 게 아니라면 이 경로로 설정해
+    find_cuda_env 가 맨 먼저 해석되게 한다.
+    """
+    if not IS_FROZEN:
+        return
+    if os.environ.get("CUDA_PATH") or os.environ.get("CUDA_HOME"):
+        return
+    meipass = getattr(sys, "_MEIPASS", None)
+    if not meipass:
+        return
+    candidate = Path(meipass) / "triton" / "backends" / "nvidia"
+    if (candidate / "bin" / "ptxas.exe").exists():
+        os.environ["CUDA_PATH"] = str(candidate)
+
+
+_point_cuda_path_at_bundled_triton()
+
+
 def _open_log_stream() -> tuple[Path, TextIO]:
     try:
         log_path = runtime_log_dir() / f"{APP_NAME}.log"
