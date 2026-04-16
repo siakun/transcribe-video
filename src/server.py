@@ -469,6 +469,11 @@ async def ws_transcribe(websocket: WebSocket):
 
             elapsed = round(time.time() - t0)
             detected = result.get("language", "?")
+            # Whisper tqdm은 clip_timestamps가 음성 구간만 커버하면 100%에 못
+            # 닿은 채 leave=True로 마지막 프레임이 서버 콘솔에 박혀 있어서,
+            # 전사가 끝난 뒤에도 화면상 "진행중"처럼 보인다. 서버 측 로그를
+            # 한 줄 찍어 커서를 tqdm 다음 줄로 밀어내고 완료를 명시한다.
+            LOGGER.info("전사 완료: %s (%d초, 언어=%s)", p.name, elapsed, detected)
 
             # 텍스트 저장
             txt_path = p.with_suffix(".txt")
@@ -508,9 +513,12 @@ async def ws_transcribe(websocket: WebSocket):
 
         if not cancel_flag.is_set():
             await websocket.send_json({"type": "done", "msg": "모든 파일 처리 완료!"})
+            LOGGER.info("세션 종료: 전체 파일 처리 완료 (%d개)", len(files))
+        else:
+            LOGGER.info("세션 종료: 사용자 취소")
 
     except WebSocketDisconnect:
-        pass
+        LOGGER.info("세션 종료: WebSocket 연결 끊김")
     except Exception as e:
         LOGGER.exception("WebSocket transcription failed")
         await websocket.send_json({"type": "error", "msg": str(e)})

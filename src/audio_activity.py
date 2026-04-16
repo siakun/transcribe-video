@@ -131,6 +131,22 @@ REPEAT_HALLUCINATION_MIN_COUNT = 3
 REPEAT_HALLUCINATION_MIN_GAP_SEC = 5.0
 REPEAT_HALLUCINATION_MAX_TEXT_LEN = 40
 
+# 실제로 관측된 Whisper 환각 문구 목록.
+# 원리 기반 필터(_looks_like_hallucination, _find_repeat_hallucinations)와
+# Whisper 내장 hallucination_silence_threshold가 못 잡는 케이스 — 대표적으로
+# 단발로 한 번만 나오고 무음 맥락이 clip_timestamps로 이미 잘려나간 상태라
+# 원리 탐지가 트리거될 조건 자체가 없는 "자막 파일 메타데이터 누출" — 을
+# 새로 마주칠 때마다 사용자가 이 집합에 관측된 문자열을 그대로 추가한다.
+# 구조를 추론하거나 정규식으로 일반화하지 않는다: 관측되지 않은 문구를
+# 임의로 막으면 진짜 발화를 오삭제할 위험이 크기 때문이다.
+OBSERVED_HALLUCINATIONS: frozenset[str] = frozenset({
+    "한글자막 by 한효정",
+})
+
+
+def _is_observed_hallucination(text: str) -> bool:
+    return text.strip() in OBSERVED_HALLUCINATIONS
+
 
 def _looks_like_hallucination(seg: dict[str, Any]) -> bool:
     text = str(seg.get("text", "")).strip()
@@ -219,6 +235,8 @@ def normalize_transcription_result(result: dict[str, Any]) -> dict[str, Any]:
     for seg in result.get("segments", []):
         text = str(seg.get("text", "")).strip()
         if not text:
+            continue
+        if _is_observed_hallucination(text):
             continue
         if _looks_like_hallucination(seg):
             continue
