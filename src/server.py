@@ -367,9 +367,21 @@ async def ws_transcribe(websocket: WebSocket):
         gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else "CPU"
         await websocket.send_json({"type": "log", "msg": f"[GPU] {gpu_name} 사용"})
 
-        # 별도 스레드에서 모델 로딩 (블로킹 방지)
+        # 별도 스레드에서 모델 로딩 (블로킹 방지). whisper.load_model은 캐시가
+        # 없으면 OpenAI CDN에서 모델을 받아오면서 tqdm을 stderr에 찍는데,
+        # 전사 때 쓰는 것과 같은 WsStream/progress_relay 경로로 묶으면 그
+        # 다운로드 진행률이 UI의 progress 줄에 그대로 나타난다.
         loop = asyncio.get_event_loop()
-        wmodel = await loop.run_in_executor(None, lambda: whisper.load_model(model, device=device))
+
+        def do_load_model():
+            stream = WsStream(progress_relay)
+            with contextlib.redirect_stderr(stream), contextlib.redirect_stdout(stream):
+                try:
+                    return whisper.load_model(model, device=device)
+                finally:
+                    stream.flush()
+
+        wmodel = await loop.run_in_executor(None, do_load_model)
         await websocket.send_json({"type": "log", "msg": f"[모델 로딩] 완료 ✓"})
 
         import time
