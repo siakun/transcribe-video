@@ -18,6 +18,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, TextIO
 
+from audio_activity import (
+    analyze_audio_activity,
+    build_transcribe_options,
+    empty_transcription_result,
+    format_activity_summary,
+    normalize_transcription_result,
+)
+
 APP_NAME = "whisper_server"
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 LOG_TIMESTAMP_FORMAT = "%Y/%m/%d %H:%M:%S"
@@ -394,6 +402,50 @@ async def ws_transcribe(websocket: WebSocket):
                 await websocket.send_json({"type": "log", "msg": "  ❌ ffmpeg를 찾을 수 없습니다. 설치 필요: winget install ffmpeg"})
                 break
 
+            await websocket.send_json({"type": "log", "msg": "  🔎 음성 구간 분석 중..."})
+            try:
+                activity = await loop.run_in_executor(None, lambda: analyze_audio_activity(audio_path))
+            except Exception as e:
+                LOGGER.exception("Audio activity analysis failed for %s", p)
+                await websocket.send_json({"type": "log", "msg": f"  ❌ 오디오 분석 오류: {e}"})
+                await websocket.send_json({"type": "file_error", "idx": idx, "name": p.name})
+                if audio_path.exists():
+                    audio_path.unlink()
+                continue
+
+            await websocket.send_json({"type": "log", "msg": f"  🧭 {format_activity_summary(activity)}"})
+
+            if not activity.regions:
+                result = empty_transcription_result(language)
+                elapsed = 0
+                detected = result.get("language", "?")
+                txt_path = p.with_suffix(".txt")
+                txt_path.write_text(result["text"], encoding="utf-8")
+                await websocket.send_json({"type": "log", "msg": f"  💾 저장: {txt_path.name}"})
+
+                if make_srt:
+                    srt_path = p.with_suffix(".srt")
+                    srt_path.write_text("", encoding="utf-8")
+                    await websocket.send_json({"type": "log", "msg": f"  💾 저장: {srt_path.name}"})
+
+                if audio_path.exists():
+                    audio_path.unlink()
+
+                await websocket.send_json({
+                    "type": "file_done",
+                    "idx": idx,
+                    "name": p.name,
+                    "elapsed": elapsed,
+                    "language": detected,
+                    "skipped": False,
+                    "preview": "",
+                })
+                await websocket.send_json({
+                    "type": "log",
+                    "msg": "  ✅ 완료 (음성 패턴 미검출, 빈 결과 저장)",
+                })
+                continue
+
             await websocket.send_json({"type": "log", "msg": f"  🤖 음성 인식 중... (모델: {model})"})
             t0 = time.time()
 
@@ -404,18 +456,17 @@ async def ws_transcribe(websocket: WebSocket):
                     try:
                         return wmodel.transcribe(
                             str(audio_path),
-                            language=language if language != "auto" else None,
-                            fp16=(device == "cuda"),
-                            verbose=False,
-                            condition_on_previous_text=True,
-                            no_speech_threshold=0.6,
-                            compression_ratio_threshold=2.4,
+                            **build_transcribe_options(
+                                language=language,
+                                fp16=(device == "cuda"),
+                                clip_timestamps=activity.clip_timestamps,
+                            ),
                         )
                     finally:
                         stream.flush()
 
             try:
-                result = await loop.run_in_executor(None, do_transcribe)
+                result = normalize_transcription_result(await loop.run_in_executor(None, do_transcribe))
             except Exception as e:
                 LOGGER.exception("Transcription failed for %s", p)
                 await websocket.send_json({"type": "log", "msg": f"  ❌ 인식 오류: {e}"})

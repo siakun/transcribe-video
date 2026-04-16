@@ -26,6 +26,14 @@ import subprocess
 import time
 from pathlib import Path
 
+from audio_activity import (
+    analyze_audio_activity,
+    build_transcribe_options,
+    empty_transcription_result,
+    format_activity_summary,
+    normalize_transcription_result,
+)
+
 # ─────────────────────────────────────────────
 # 모델 정보
 # ─────────────────────────────────────────────
@@ -59,18 +67,21 @@ def extract_audio(video_path: Path, audio_path: Path) -> bool:
     return True
 
 
-def transcribe(audio_path: Path, model, language: str) -> dict:
+def transcribe(audio_path: Path, model, language: str, fp16: bool) -> tuple[dict, object]:
     """Whisper로 음성 인식 수행"""
+    activity = analyze_audio_activity(audio_path)
+    if not activity.regions:
+        return empty_transcription_result(language), activity
+
     result = model.transcribe(
         str(audio_path),
-        language=language if language != "auto" else None,
-        fp16=True,          # RTX 5080에서 2배 빠름
-        verbose=False,      # 배치 처리 시 출력 정리
-        condition_on_previous_text=True,  # 긴 영상에서 문맥 유지
-        no_speech_threshold=0.6,          # 무음 구간 필터링
-        compression_ratio_threshold=2.4,  # 반복 감지
+        **build_transcribe_options(
+            language=language,
+            fp16=fp16,
+            clip_timestamps=activity.clip_timestamps,
+        ),
     )
-    return result
+    return normalize_transcription_result(result), activity
 
 
 def save_text(text: str, output_path: Path):
@@ -101,6 +112,7 @@ def process_single_file(
     video_path: Path,
     model,
     language: str,
+    fp16: bool,
     output_dir: Path | None,
     save_srt_flag: bool,
     keep_audio: bool,
@@ -124,14 +136,17 @@ def process_single_file(
     if not extract_audio(video_path, audio_path):
         return False
 
+    print(f"  🔎 음성 구간 분석 중...")
     print(f"  🤖 음성 인식 중...")
     try:
-        result = transcribe(audio_path, model, language)
+        result, activity = transcribe(audio_path, model, language, fp16)
     except Exception as e:
         print(f"  ❌ 인식 오류: {e}")
         if audio_path.exists():
             audio_path.unlink()
         return False
+
+    print(f"  🧭 {format_activity_summary(activity)}")
 
     # 결과 저장
     save_text(result["text"], txt_path)
@@ -280,6 +295,7 @@ def main():
             video_path=video_path,
             model=model,
             language=args.language,
+            fp16=(device == "cuda"),
             output_dir=output_dir,
             save_srt_flag=args.srt,
             keep_audio=args.keep_audio,
