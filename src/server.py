@@ -297,6 +297,7 @@ class ProgressRelay:
         self.lock = threading.Lock()
         self.latest: Optional[str] = None
         self.closed = False
+        self.push_count = 0  # 진단용: push 단계가 아예 호출되지 않는 경로를 가려내기 위한 카운터
 
     def push(self, line: str):
         clean = ANSI_ESCAPE_RE.sub("", line).strip()
@@ -304,6 +305,7 @@ class ProgressRelay:
             return
         with self.lock:
             self.latest = clean
+            self.push_count += 1
 
     def pop_latest(self) -> Optional[str]:
         with self.lock:
@@ -344,7 +346,11 @@ async def pump_progress(relay: ProgressRelay, websocket: WebSocket):
         LOGGER.exception("Progress relay failed")
         relay.close()
     finally:
-        LOGGER.info("progress 송출 요약: %d건", sent_count)
+        LOGGER.info(
+            "progress 송출 요약: push=%d건, send=%d건",
+            relay.push_count,
+            sent_count,
+        )
 
 
 # ─────────────────────────────────────────────
