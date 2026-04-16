@@ -11,17 +11,17 @@ set "PYTHON_EXE=.venv\Scripts\python.exe"
 set "OUTPUT_ROOT=build"
 set "TEMP_ROOT=temp"
 set "LOG_DIR=logs"
-set "BUILD_LOG=%LOG_DIR%\build.log"
 set "PAUSE_ON_EXIT=1"
 
 if /i "%~1"=="--no-pause" set "PAUSE_ON_EXIT=0"
 
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "BUILD_STAMP=%%i"
+set "BUILD_LOG=%LOG_DIR%\[build] %BUILD_STAMP%.log"
 > "%BUILD_LOG%" echo ================================================================================
 >> "%BUILD_LOG%" echo build.bat started in %CD%
 >> "%BUILD_LOG%" echo.
 
-for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "BUILD_STAMP=%%i"
 set "OUTPUT_DIR=%OUTPUT_ROOT%\%BUILD_STAMP%"
 set "TEMP_DIR=%TEMP_ROOT%\%BUILD_STAMP%"
 set "SPEC_DIR=%TEMP_DIR%\spec"
@@ -134,13 +134,16 @@ call :log [2/2] Build complete.
 call :log Output: %CD%\%OUTPUT_DIR%\%APP_NAME%\%APP_NAME%.exe
 echo.
 >> "%BUILD_LOG%" echo.
-> "%OUTPUT_ROOT%\latest.txt" echo %OUTPUT_DIR%\%APP_NAME%\%APP_NAME%.exe
-> "%OUTPUT_ROOT%\run_latest.bat" echo @echo off
->> "%OUTPUT_ROOT%\run_latest.bat" echo cd /d "%%~dp0%BUILD_STAMP%\%APP_NAME%"
->> "%OUTPUT_ROOT%\run_latest.bat" echo "%APP_NAME%.exe"
+rem Block redirection writes run_latest.bat atomically; splitting into
+rem multiple > / >> calls was observed to leave the file at an older
+rem BUILD_STAMP when one of the sub-writes silently failed.
+(
+  echo @echo off
+  echo cd /d "%%~dp0%BUILD_STAMP%\%APP_NAME%"
+  echo "%APP_NAME%.exe"
+) > "%OUTPUT_ROOT%\run_latest.bat"
 call :log Notes:
 call :log Run: %OUTPUT_DIR%\%APP_NAME%\%APP_NAME%.exe
-call :log Latest: %OUTPUT_ROOT%\latest.txt
 call :log Launcher: %OUTPUT_ROOT%\run_latest.bat
 call :log Keep the whole %OUTPUT_DIR%\%APP_NAME% folder together when moving it.
 call :log Startup/crash logs are written to logs\%APP_NAME%.log next to the exe.
