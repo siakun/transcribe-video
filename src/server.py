@@ -306,6 +306,9 @@ class ProgressRelay:
         with self.lock:
             self.latest = clean
             self.push_count += 1
+            should_log = self.push_count == 1 or self.push_count % 50 == 0
+        if should_log:
+            LOGGER.info("relay.push 누적: %d건", self.push_count)
 
     def pop_latest(self) -> Optional[str]:
         with self.lock:
@@ -340,6 +343,8 @@ async def pump_progress(relay: ProgressRelay, websocket: WebSocket):
                 await websocket.send_json({"type": "progress", "msg": line})
                 last_sent = line
                 sent_count += 1
+                if sent_count == 1 or sent_count % 50 == 0:
+                    LOGGER.info("pump.send 누적: %d건", sent_count)
             else:
                 await asyncio.sleep(0.12)
     except Exception:
