@@ -99,6 +99,11 @@ def build_transcribe_options(
         "condition_on_previous_text": False,
         "no_speech_threshold": 0.6,
         "compression_ratio_threshold": 2.4,
+        # word_timestamps + hallucination_silence_threshold은 Whisper 자체의
+        # 언어 무관 환각 탐지기를 켠다: 단어 단위 probability/duration 이상치로
+        # is_segment_anomaly를 판별해 무음에 둘러싸인 환각 세그먼트를 건너뛴다.
+        "word_timestamps": True,
+        "hallucination_silence_threshold": 2.0,
     }
     if clip_timestamps:
         options["clip_timestamps"] = list(clip_timestamps)
@@ -110,39 +115,21 @@ def empty_transcription_result(language: str) -> dict[str, Any]:
     return {"text": "", "segments": [], "language": detected}
 
 
-# 세그먼트 품질 임계값 — Whisper가 뱉은 메타데이터로 환각 여부를 판단한다.
+# Whisper 메타데이터 기반 세그먼트 품질 임계값 — 극단적으로 나쁜 케이스만 버린다.
 HALLUCINATION_LOGPROB_MAX = -1.0
 HALLUCINATION_NO_SPEECH_MIN = 0.6
 HALLUCINATION_COMPRESSION_MAX = 2.4
-# 긴 세그먼트인데 글자가 거의 없으면(= 무음에 YouTube outro 문구만 찍힌 케이스) 환각으로 본다.
+# 긴 세그먼트인데 글자가 거의 없으면 전형적인 "30초 창 + 짧은 환각 문장" 패턴.
 LOW_DENSITY_MIN_DURATION_SEC = 5.0
 LOW_DENSITY_MIN_CHARS_PER_SEC = 1.5
-# 한국어 Whisper가 학습 데이터의 YouTube outro에서 가져와 노이즈 구간에 자주 찍는 표현.
-# 공백을 지운 상태에서 substring 매칭한다.
-KOREAN_HALLUCINATION_PATTERNS: tuple[str, ...] = (
-    "시청해주셔서",
-    "시청해주셔서감사",
-    "구독과좋아요",
-    "구독좋아요",
-    "좋아요와구독",
-    "알림설정",
-    "다음영상",
-    "다음시간",
-    "다음영상에서만나",
-    "다음영상에서뵙",
-    "영상에서만나",
-    "영상에서뵙",
-    "만나뵙겠습니다",
-    "여러분안녕하세요",
-    "감사합니다",
-)
-# 패턴에 걸렸을 때 "진짜 말했을 수도 있다"를 배제하기 위해 둘 다 만족해야 drop.
-SUSPICIOUS_PATTERN_LOGPROB_MAX = -0.5
-SUSPICIOUS_PATTERN_NO_SPEECH_MIN = 0.3
 
-
-def _text_compact(text: str) -> str:
-    return "".join(text.split())
+# 결정론적 환각 루프 탐지 — 언어 무관.
+# 원리: Whisper가 무음/노이즈 구간에서 내는 환각은 같은 입력에 같은 출력을 내는 deterministic
+# 특성이 있어서 동일 텍스트가 여러 번 반복되고 각 반복 사이에 실제 발화가 없다(=간격이 크다).
+# 진짜 말 중에 반복되는 filler("자 이제")와 구분하려면 "모든 인접 간격 > 수초"를 요구한다.
+REPEAT_HALLUCINATION_MIN_COUNT = 3
+REPEAT_HALLUCINATION_MIN_GAP_SEC = 5.0
+REPEAT_HALLUCINATION_MAX_TEXT_LEN = 40
 
 
 def _looks_like_hallucination(seg: dict[str, Any]) -> bool:
@@ -167,15 +154,41 @@ def _looks_like_hallucination(seg: dict[str, Any]) -> bool:
         if density < LOW_DENSITY_MIN_CHARS_PER_SEC:
             return True
 
-    compact = _text_compact(text)
-    if compact and any(pat in compact for pat in KOREAN_HALLUCINATION_PATTERNS):
-        if (
-            avg_logprob < SUSPICIOUS_PATTERN_LOGPROB_MAX
-            and no_speech_prob > SUSPICIOUS_PATTERN_NO_SPEECH_MIN
-        ):
-            return True
-
     return False
+
+
+def _dedup_key(text: str) -> str:
+    return "".join(text.split()).lower()
+
+
+def _find_repeat_hallucinations(segments: list[dict[str, Any]]) -> set[int]:
+    """같은 텍스트가 반복되는데 반복 사이 간격이 모두 큰 경우를 환각 루프로 본다."""
+    buckets: dict[str, list[int]] = {}
+    for idx, seg in enumerate(segments):
+        text = str(seg.get("text", "")).strip()
+        if not text:
+            continue
+        key = _dedup_key(text)
+        if not key or len(key) > REPEAT_HALLUCINATION_MAX_TEXT_LEN:
+            continue
+        buckets.setdefault(key, []).append(idx)
+
+    drop: set[int] = set()
+    for indices in buckets.values():
+        if len(indices) < REPEAT_HALLUCINATION_MIN_COUNT:
+            continue
+        ordered = sorted(
+            indices,
+            key=lambda i: float(segments[i].get("start", 0.0)),
+        )
+        gaps = [
+            float(segments[ordered[i]].get("start", 0.0))
+            - float(segments[ordered[i - 1]].get("end", 0.0))
+            for i in range(1, len(ordered))
+        ]
+        if gaps and all(g >= REPEAT_HALLUCINATION_MIN_GAP_SEC for g in gaps):
+            drop.update(ordered)
+    return drop
 
 
 def _deoverlap_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -201,7 +214,7 @@ def _deoverlap_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def normalize_transcription_result(result: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(result)
-    kept: list[dict[str, Any]] = []
+    first_pass: list[dict[str, Any]] = []
 
     for seg in result.get("segments", []):
         text = str(seg.get("text", "")).strip()
@@ -211,7 +224,10 @@ def normalize_transcription_result(result: dict[str, Any]) -> dict[str, Any]:
             continue
         clean_seg = dict(seg)
         clean_seg["text"] = text
-        kept.append(clean_seg)
+        first_pass.append(clean_seg)
+
+    repeat_drop = _find_repeat_hallucinations(first_pass)
+    kept = [seg for idx, seg in enumerate(first_pass) if idx not in repeat_drop]
 
     kept = _deoverlap_segments(kept)
 
