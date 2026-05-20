@@ -156,6 +156,7 @@ try {
         '--specpath', $SpecDir,
         '--workpath', $WorkDir,
         '--add-data', "$IndexHtmlAbs;.",
+        '--add-binary', "$ScriptRoot\bin\yt-dlp.exe;.",
         '--collect-all', 'faster_whisper',
         '--collect-all', 'ctranslate2',
         '--collect-all', 'huggingface_hub',
