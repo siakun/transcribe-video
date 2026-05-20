@@ -231,11 +231,24 @@ try {
     Write-Log 'ffmpeg must be installed and available in PATH at runtime.'
     Write-Log 'The first transcription can still download a Whisper model if it is not cached yet.'
 
-    if (Test-Path -LiteralPath $TempDir) {
-        Remove-Item -LiteralPath $TempDir -Recurse -Force
+    # Best-effort temp cleanup. The build already succeeded, so a cleanup
+    # hiccup (e.g. a transiently locked file) must not fail the run -- the old
+    # build.bat ignored these errors too (rmdir /q, rd 2>nul).
+    try {
+        if (Test-Path -LiteralPath $TempDir) {
+            Remove-Item -LiteralPath $TempDir -Recurse -Force
+        }
+        # Drop the temp root only when it is empty, mirroring `rd %TEMP_ROOT%`,
+        # so a leftover dir from another build is never clobbered. Remove-Item
+        # on a non-empty directory without -Recurse pops a confirmation prompt
+        # that -ErrorAction cannot suppress, so test for emptiness first.
+        if ((Test-Path -LiteralPath $TempRoot) -and
+            -not (Get-ChildItem -LiteralPath $TempRoot -Force)) {
+            Remove-Item -LiteralPath $TempRoot -Force
+        }
     }
-    if (Test-Path -LiteralPath $TempRoot) {
-        Remove-Item -LiteralPath $TempRoot -Force -ErrorAction SilentlyContinue
+    catch {
+        Write-Log "[WARN] Temp cleanup skipped: $($_.Exception.Message)"
     }
 }
 catch {
