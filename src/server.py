@@ -370,6 +370,230 @@ async def _run_transcribe_with_progress(
 
 
 # ─────────────────────────────────────────────
+# 모델 로딩 + 파일 1개 전사 (로컬 파일·유튜브 경로가 공유)
+# ─────────────────────────────────────────────
+async def ensure_model(
+    websocket: WebSocket,
+    model_name: str,
+    loop: asyncio.AbstractEventLoop,
+):
+    """faster-whisper 모델을 로딩(또는 캐시 재사용)하고 wmodel을 반환한다.
+
+    모델 로딩·GPU 로그를 WebSocket으로 전송한다.
+    """
+    await websocket.send_json({
+        "type": "log",
+        "msg": f"[모델 로딩] faster-whisper {model_name} 로딩 중...",
+    })
+
+    from faster_whisper import WhisperModel
+    import torch
+
+    if torch.cuda.is_available():
+        device = "cuda"
+        gpu_name = torch.cuda.get_device_name(0)
+        compute_type = "float16"
+    else:
+        device = "cpu"
+        gpu_name = "CPU"
+        compute_type = "int8"
+
+    await websocket.send_json({
+        "type": "log",
+        "msg": f"[GPU] {gpu_name} 사용 (compute_type={compute_type})",
+    })
+
+    def _load_or_get_cached():
+        global _cached_model, _cached_model_key
+        key = (model_name, device, compute_type)
+        with _model_cache_lock:
+            if _cached_model is not None and _cached_model_key == key:
+                return _cached_model, True
+            # 모델 키가 바뀌면 기존 캐시를 먼저 비워서 두 개의 CTranslate2
+            # 모델이 동시에 GPU 메모리를 점유하지 않게 한다.
+            _cached_model = None
+            _cached_model_key = None
+            new_model = WhisperModel(model_name, device=device, compute_type=compute_type)
+            _cached_model = new_model
+            _cached_model_key = key
+            return new_model, False
+
+    wmodel, was_cached = await loop.run_in_executor(None, _load_or_get_cached)
+    await websocket.send_json({
+        "type": "log",
+        "msg": "[모델 로딩] 완료 ✓ (캐시 재사용)" if was_cached else "[모델 로딩] 완료 ✓",
+    })
+    return wmodel
+
+
+async def transcribe_file(
+    websocket: WebSocket,
+    wmodel,
+    idx: int,
+    total: int,
+    file_path: str,
+    language: str,
+    make_srt: bool,
+    loop: asyncio.AbstractEventLoop,
+) -> bool:
+    """파일 1개를 전사하고 txt/srt를 저장한다. file_start ~ file_done 메시지를 보낸다.
+
+    반환값: 계속 진행하면 True, 세션 전체를 중단해야 하면 False(ffmpeg가 없으면
+    다음 파일도 실패하므로 중단한다). 호출 측에서 cancel_flag 검사와 모델 로딩을
+    책임진다. 로컬 파일(ws_transcribe)과 유튜브(ws_youtube) 경로가 공유한다.
+    """
+    import time
+
+    p = Path(file_path)
+    await websocket.send_json({
+        "type": "file_start",
+        "idx": idx,
+        "total": total,
+        "name": p.name,
+        "path": str(file_path),
+    })
+
+    # 이미 처리된 파일
+    if p.with_suffix(".txt").exists():
+        await websocket.send_json({"type": "log", "msg": f"  ⏭ 건너뜀 (이미 완료): {p.name}"})
+        await websocket.send_json({
+            "type": "file_done",
+            "idx": idx,
+            "name": p.name,
+            "skipped": True,
+            "has_srt": p.with_suffix(".srt").exists(),
+        })
+        return True
+
+    # 오디오 추출
+    await websocket.send_json({"type": "log", "msg": f"  🎬 오디오 추출 중..."})
+    audio_path = make_temp_audio_path(p)
+
+    try:
+        # ffmpeg가 한글 경로를 인식하지 못하는 버그를 피하기 위해,
+        # Python에서 파일을 열어 ffmpeg stdin으로 직접 파이프합니다.
+        with open(p, "rb") as video_file:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", "pipe:0",
+                "-ac", "1", "-ar", "16000", "-vn", str(audio_path),
+                stdin=video_file,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+
+            if proc.returncode != 0:
+                await websocket.send_json({"type": "log", "msg": f"  ❌ ffmpeg 오류: {stderr.decode(errors='replace')[-300:]}"})
+                await websocket.send_json({"type": "file_error", "idx": idx, "name": p.name})
+                return True
+    except FileNotFoundError:
+        await websocket.send_json({"type": "log", "msg": "  ❌ ffmpeg를 찾을 수 없습니다. 설치 필요: winget install ffmpeg"})
+        return False
+
+    await websocket.send_json({"type": "log", "msg": "  🔎 음성 구간 분석 중..."})
+    try:
+        activity = await loop.run_in_executor(None, lambda: analyze_audio_activity(audio_path))
+    except Exception as e:
+        LOGGER.exception("Audio activity analysis failed for %s", p)
+        await websocket.send_json({"type": "log", "msg": f"  ❌ 오디오 분석 오류: {e}"})
+        await websocket.send_json({"type": "file_error", "idx": idx, "name": p.name})
+        if audio_path.exists():
+            audio_path.unlink()
+        return True
+
+    await websocket.send_json({"type": "log", "msg": f"  🧭 {format_activity_summary(activity)}"})
+
+    if not activity.regions:
+        result = empty_transcription_result(language)
+        elapsed = 0
+        detected = result.get("language", "?")
+        txt_path = p.with_suffix(".txt")
+        txt_path.write_text(result["text"], encoding="utf-8")
+        await websocket.send_json({"type": "log", "msg": f"  💾 저장: {txt_path.name}"})
+
+        if make_srt:
+            srt_path = p.with_suffix(".srt")
+            srt_path.write_text("", encoding="utf-8")
+            await websocket.send_json({"type": "log", "msg": f"  💾 저장: {srt_path.name}"})
+
+        if audio_path.exists():
+            audio_path.unlink()
+
+        await websocket.send_json({
+            "type": "file_done",
+            "idx": idx,
+            "name": p.name,
+            "elapsed": elapsed,
+            "language": detected,
+            "skipped": False,
+            "preview": "",
+            "has_srt": make_srt,
+        })
+        await websocket.send_json({
+            "type": "log",
+            "msg": "  ✅ 완료 (음성 패턴 미검출, 빈 결과 저장)",
+        })
+        return True
+
+    await websocket.send_json({"type": "log", "msg": "  🤖 음성 인식 중..."})
+    t0 = time.time()
+
+    try:
+        result = await _run_transcribe_with_progress(
+            wmodel, audio_path, activity, language, loop, websocket,
+        )
+    except Exception as e:
+        LOGGER.exception("Transcription failed for %s", p)
+        await websocket.send_json({"type": "log", "msg": f"  ❌ 인식 오류: {e}"})
+        await websocket.send_json({"type": "file_error", "idx": idx, "name": p.name})
+        if audio_path.exists():
+            audio_path.unlink()
+        return True
+
+    elapsed = round(time.time() - t0)
+    detected = result.get("language", "?")
+    LOGGER.info("전사 완료: %s (%d초, 언어=%s)", p.name, elapsed, detected)
+
+    # 텍스트 저장
+    txt_path = p.with_suffix(".txt")
+    txt_path.write_text(result["text"], encoding="utf-8")
+    await websocket.send_json({"type": "log", "msg": f"  💾 저장: {txt_path.name}"})
+
+    # SRT 저장
+    if make_srt:
+        srt_path = p.with_suffix(".srt")
+        srt_lines = []
+        for i, seg in enumerate(result["segments"], 1):
+            def ts(s):
+                h, r = divmod(s, 3600)
+                m, s2 = divmod(r, 60)
+                return f"{int(h):02d}:{int(m):02d}:{int(s2):02d},{int((s2%1)*1000):03d}"
+            srt_lines.append(f"{i}\n{ts(seg['start'])} --> {ts(seg['end'])}\n{seg['text'].strip()}\n")
+        srt_path.write_text("\n".join(srt_lines), encoding="utf-8")
+        await websocket.send_json({"type": "log", "msg": f"  💾 저장: {srt_path.name}"})
+
+    # 임시 파일 삭제
+    if audio_path.exists():
+        audio_path.unlink()
+
+    await websocket.send_json({
+        "type": "file_done",
+        "idx": idx,
+        "name": p.name,
+        "elapsed": elapsed,
+        "language": detected,
+        "skipped": False,
+        "preview": result["text"][:200],
+        "has_srt": make_srt,
+    })
+    await websocket.send_json({
+        "type": "log",
+        "msg": f"  ✅ 완료 ({elapsed}초) | 언어: {detected}",
+    })
+    return True
+
+
+# ─────────────────────────────────────────────
 # WebSocket - 실시간 변환
 # ─────────────────────────────────────────────
 @app.websocket("/ws/transcribe")
@@ -397,204 +621,18 @@ async def ws_transcribe(websocket: WebSocket):
 
         await websocket.send_json({"type": "start", "total": len(files)})
 
-        await websocket.send_json({
-            "type": "log",
-            "msg": f"[모델 로딩] faster-whisper {model_name} 로딩 중...",
-        })
-
-        from faster_whisper import WhisperModel
-        import torch
-
-        if torch.cuda.is_available():
-            device = "cuda"
-            gpu_name = torch.cuda.get_device_name(0)
-            compute_type = "float16"
-        else:
-            device = "cpu"
-            gpu_name = "CPU"
-            compute_type = "int8"
-
-        await websocket.send_json({
-            "type": "log",
-            "msg": f"[GPU] {gpu_name} 사용 (compute_type={compute_type})",
-        })
-
         loop = asyncio.get_event_loop()
-
-        def _load_or_get_cached():
-            global _cached_model, _cached_model_key
-            key = (model_name, device, compute_type)
-            with _model_cache_lock:
-                if _cached_model is not None and _cached_model_key == key:
-                    return _cached_model, True
-                # 모델 키가 바뀌면 기존 캐시를 먼저 비워서 두 개의 CTranslate2
-                # 모델이 동시에 GPU 메모리를 점유하지 않게 한다.
-                _cached_model = None
-                _cached_model_key = None
-                new_model = WhisperModel(model_name, device=device, compute_type=compute_type)
-                _cached_model = new_model
-                _cached_model_key = key
-                return new_model, False
-
-        wmodel, was_cached = await loop.run_in_executor(None, _load_or_get_cached)
-        await websocket.send_json({
-            "type": "log",
-            "msg": "[모델 로딩] 완료 ✓ (캐시 재사용)" if was_cached else "[모델 로딩] 완료 ✓",
-        })
-
-        import time
+        wmodel = await ensure_model(websocket, model_name, loop)
 
         for idx, file_path in enumerate(files, 1):
             if cancel_flag.is_set():
                 await websocket.send_json({"type": "cancelled", "msg": "사용자가 취소했습니다."})
                 break
-
-            p = Path(file_path)
-            await websocket.send_json({
-                "type": "file_start",
-                "idx": idx,
-                "total": len(files),
-                "name": p.name,
-                "path": file_path,
-            })
-
-            # 이미 처리된 파일
-            if p.with_suffix(".txt").exists():
-                await websocket.send_json({"type": "log", "msg": f"  ⏭ 건너뜀 (이미 완료): {p.name}"})
-                await websocket.send_json({
-                    "type": "file_done",
-                    "idx": idx,
-                    "name": p.name,
-                    "skipped": True,
-                    "has_srt": p.with_suffix(".srt").exists(),
-                })
-                continue
-
-            # 오디오 추출
-            await websocket.send_json({"type": "log", "msg": f"  🎬 오디오 추출 중..."})
-            audio_path = make_temp_audio_path(p)
-
-            try:
-                # ffmpeg가 한글 경로를 인식하지 못하는 버그를 피하기 위해,
-                # Python에서 파일을 열어 ffmpeg stdin으로 직접 파이프합니다.
-                with open(p, "rb") as video_file:
-                    proc = await asyncio.create_subprocess_exec(
-                        "ffmpeg", "-y", "-i", "pipe:0",
-                        "-ac", "1", "-ar", "16000", "-vn", str(audio_path),
-                        stdin=video_file,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    _, stderr = await proc.communicate()
-
-                    if proc.returncode != 0:
-                        await websocket.send_json({"type": "log", "msg": f"  ❌ ffmpeg 오류: {stderr.decode(errors='replace')[-300:]}"})
-                        await websocket.send_json({"type": "file_error", "idx": idx, "name": p.name})
-                        continue
-            except FileNotFoundError:
-                await websocket.send_json({"type": "log", "msg": "  ❌ ffmpeg를 찾을 수 없습니다. 설치 필요: winget install ffmpeg"})
+            ok = await transcribe_file(
+                websocket, wmodel, idx, len(files), file_path, language, make_srt, loop,
+            )
+            if not ok:
                 break
-
-            await websocket.send_json({"type": "log", "msg": "  🔎 음성 구간 분석 중..."})
-            try:
-                activity = await loop.run_in_executor(None, lambda: analyze_audio_activity(audio_path))
-            except Exception as e:
-                LOGGER.exception("Audio activity analysis failed for %s", p)
-                await websocket.send_json({"type": "log", "msg": f"  ❌ 오디오 분석 오류: {e}"})
-                await websocket.send_json({"type": "file_error", "idx": idx, "name": p.name})
-                if audio_path.exists():
-                    audio_path.unlink()
-                continue
-
-            await websocket.send_json({"type": "log", "msg": f"  🧭 {format_activity_summary(activity)}"})
-
-            if not activity.regions:
-                result = empty_transcription_result(language)
-                elapsed = 0
-                detected = result.get("language", "?")
-                txt_path = p.with_suffix(".txt")
-                txt_path.write_text(result["text"], encoding="utf-8")
-                await websocket.send_json({"type": "log", "msg": f"  💾 저장: {txt_path.name}"})
-
-                if make_srt:
-                    srt_path = p.with_suffix(".srt")
-                    srt_path.write_text("", encoding="utf-8")
-                    await websocket.send_json({"type": "log", "msg": f"  💾 저장: {srt_path.name}"})
-
-                if audio_path.exists():
-                    audio_path.unlink()
-
-                await websocket.send_json({
-                    "type": "file_done",
-                    "idx": idx,
-                    "name": p.name,
-                    "elapsed": elapsed,
-                    "language": detected,
-                    "skipped": False,
-                    "preview": "",
-                    "has_srt": make_srt,
-                })
-                await websocket.send_json({
-                    "type": "log",
-                    "msg": "  ✅ 완료 (음성 패턴 미검출, 빈 결과 저장)",
-                })
-                continue
-
-            await websocket.send_json({"type": "log", "msg": f"  🤖 음성 인식 중... (모델: {model_name})"})
-            t0 = time.time()
-
-            try:
-                result = await _run_transcribe_with_progress(
-                    wmodel, audio_path, activity, language, loop, websocket,
-                )
-            except Exception as e:
-                LOGGER.exception("Transcription failed for %s", p)
-                await websocket.send_json({"type": "log", "msg": f"  ❌ 인식 오류: {e}"})
-                await websocket.send_json({"type": "file_error", "idx": idx, "name": p.name})
-                if audio_path.exists():
-                    audio_path.unlink()
-                continue
-
-            elapsed = round(time.time() - t0)
-            detected = result.get("language", "?")
-            LOGGER.info("전사 완료: %s (%d초, 언어=%s)", p.name, elapsed, detected)
-
-            # 텍스트 저장
-            txt_path = p.with_suffix(".txt")
-            txt_path.write_text(result["text"], encoding="utf-8")
-            await websocket.send_json({"type": "log", "msg": f"  💾 저장: {txt_path.name}"})
-
-            # SRT 저장
-            if make_srt:
-                srt_path = p.with_suffix(".srt")
-                srt_lines = []
-                for i, seg in enumerate(result["segments"], 1):
-                    def ts(s):
-                        h, r = divmod(s, 3600)
-                        m, s2 = divmod(r, 60)
-                        return f"{int(h):02d}:{int(m):02d}:{int(s2):02d},{int((s2%1)*1000):03d}"
-                    srt_lines.append(f"{i}\n{ts(seg['start'])} --> {ts(seg['end'])}\n{seg['text'].strip()}\n")
-                srt_path.write_text("\n".join(srt_lines), encoding="utf-8")
-                await websocket.send_json({"type": "log", "msg": f"  💾 저장: {srt_path.name}"})
-
-            # 임시 파일 삭제
-            if audio_path.exists():
-                audio_path.unlink()
-
-            await websocket.send_json({
-                "type": "file_done",
-                "idx": idx,
-                "name": p.name,
-                "elapsed": elapsed,
-                "language": detected,
-                "skipped": False,
-                "preview": result["text"][:200],
-                "has_srt": make_srt,
-            })
-            await websocket.send_json({
-                "type": "log",
-                "msg": f"  ✅ 완료 ({elapsed}초) | 언어: {detected}",
-            })
 
         if not cancel_flag.is_set():
             await websocket.send_json({"type": "done", "msg": "모든 파일 처리 완료!"})
