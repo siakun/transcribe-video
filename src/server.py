@@ -29,6 +29,7 @@ from runtime_paths import (
     runtime_log_dir,
 )
 from folder_dialog import pick_folder
+import youtube
 
 APP_NAME = "whisper_server"
 IS_FROZEN = is_frozen()
@@ -644,6 +645,111 @@ async def ws_transcribe(websocket: WebSocket):
         LOGGER.info("세션 종료: WebSocket 연결 끊김")
     except Exception as e:
         LOGGER.exception("WebSocket transcription failed")
+        await websocket.send_json({"type": "error", "msg": str(e)})
+    finally:
+        is_running = False
+        cancel_flag.clear()
+
+
+# ─────────────────────────────────────────────
+# WebSocket - 유튜브 다운로드 + 전사
+# ─────────────────────────────────────────────
+@app.websocket("/ws/youtube")
+async def ws_youtube(websocket: WebSocket):
+    global is_running
+    await websocket.accept()
+
+    try:
+        data = await websocket.receive_json()
+        url: str = (data.get("url") or "").strip()
+        dest_folder: str = (data.get("folder") or "").strip()
+        model_name: str = data.get("model", "turbo")
+        language: str = data.get("language", "ko")
+        make_srt: bool = data.get("srt", True)
+
+        if not url:
+            await websocket.send_json({"type": "error", "msg": "유튜브 URL이 비었습니다."})
+            return
+        if not dest_folder:
+            await websocket.send_json({"type": "error", "msg": "먼저 폴더를 선택하세요."})
+            return
+        if is_running:
+            await websocket.send_json({"type": "error", "msg": "이미 변환이 실행 중입니다."})
+            return
+
+        is_running = True
+        cancel_flag.clear()
+        loop = asyncio.get_event_loop()
+
+        # URL 해석
+        await websocket.send_json({"type": "log", "msg": "[유튜브] URL 해석 중..."})
+        try:
+            resolved = await loop.run_in_executor(None, lambda: youtube.resolve(url))
+        except youtube.YoutubeError as e:
+            await websocket.send_json({"type": "error", "msg": str(e)})
+            return
+
+        dest = Path(dest_folder)
+        if resolved.is_playlist:
+            dest = dest / resolved.playlist_title
+        await websocket.send_json({
+            "type": "yt_resolve",
+            "count": len(resolved.entries),
+            "playlist_title": resolved.playlist_title,
+        })
+        await websocket.send_json({"type": "start", "total": len(resolved.entries)})
+
+        wmodel = await ensure_model(websocket, model_name, loop)
+
+        total = len(resolved.entries)
+        for idx, entry in enumerate(resolved.entries, 1):
+            if cancel_flag.is_set():
+                await websocket.send_json({"type": "cancelled", "msg": "사용자가 취소했습니다."})
+                break
+
+            await websocket.send_json({"type": "log", "msg": f"\n[{idx}/{total}] ⬇ {entry.title}"})
+
+            # 다운로드 — 진행률은 워커 스레드에서 큐로 넘겨 메인 코루틴이 전송한다.
+            q: asyncio.Queue = asyncio.Queue()
+
+            def progress_cb(pct: float):
+                loop.call_soon_threadsafe(q.put_nowait, pct)
+
+            fut = loop.run_in_executor(
+                None, lambda e=entry: youtube.download(e.url, dest, progress_cb),
+            )
+            while not fut.done() or not q.empty():
+                try:
+                    pct = await asyncio.wait_for(q.get(), timeout=0.3)
+                except asyncio.TimeoutError:
+                    continue
+                await websocket.send_json({
+                    "type": "yt_download",
+                    "idx": idx, "total": total,
+                    "name": entry.title, "pct": pct,
+                })
+            try:
+                video_path = await fut
+            except youtube.YoutubeError as e:
+                await websocket.send_json({"type": "log", "msg": f"  ❌ 다운로드 실패: {e}"})
+                await websocket.send_json({"type": "file_error", "idx": idx, "name": entry.title})
+                continue
+
+            await websocket.send_json({"type": "log", "msg": "  ✓ 다운로드 완료, 전사 시작"})
+            await transcribe_file(
+                websocket, wmodel, idx, total, video_path, language, make_srt, loop,
+            )
+
+        if not cancel_flag.is_set():
+            await websocket.send_json({"type": "done", "msg": "유튜브 다운로드 + 전사 완료!"})
+            LOGGER.info("유튜브 세션 종료: %d개 처리", total)
+        else:
+            LOGGER.info("유튜브 세션 종료: 사용자 취소")
+
+    except WebSocketDisconnect:
+        LOGGER.info("유튜브 세션 종료: WebSocket 연결 끊김")
+    except Exception as e:
+        LOGGER.exception("ws_youtube failed")
         await websocket.send_json({"type": "error", "msg": str(e)})
     finally:
         is_running = False
