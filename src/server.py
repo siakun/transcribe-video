@@ -28,6 +28,7 @@ from runtime_paths import (
     runtime_base_dir,
     runtime_log_dir,
 )
+from folder_dialog import pick_folder
 
 APP_NAME = "whisper_server"
 IS_FROZEN = is_frozen()
@@ -227,6 +228,17 @@ async def cancel():
     cancel_flag.set()
     is_running = False
     return {"ok": True}
+
+
+# ─────────────────────────────────────────────
+# 폴더 선택 대화상자 API
+# ─────────────────────────────────────────────
+@app.post("/api/pick-folder")
+async def pick_folder_endpoint():
+    """네이티브 폴더 대화상자를 띄우고 선택된 절대경로를 반환한다."""
+    loop = asyncio.get_event_loop()
+    path = await loop.run_in_executor(None, pick_folder)
+    return {"path": path}
 
 
 # ─────────────────────────────────────────────
