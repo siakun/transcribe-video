@@ -228,8 +228,8 @@ def main():
     parser.add_argument(
         "--model", "-m",
         choices=list(MODEL_INFO.keys()),
-        default="turbo",
-        help="Whisper 모델 (기본값: turbo)"
+        default="large-v3",
+        help="Whisper 모델 (기본값: large-v3)"
     )
     parser.add_argument(
         "--language", "-l",

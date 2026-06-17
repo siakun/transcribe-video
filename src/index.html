@@ -102,6 +102,8 @@
     display: flex; gap: 10px; margin-top: 10px;
   }
   .settings-row label { font-size: 12px; color: #94a3b8; display: flex; align-items: center; gap: 6px; }
+  .model-hint { font-size: 11px; color: #94a3b8; margin-top: 6px; line-height: 1.5; }
+  .model-hint .sub { color: #64748b; }
   select, .btn-sm {
     background: #1e2536; border: 1px solid #2d3748;
     color: #e2e8f0; border-radius: 5px;
@@ -284,8 +286,8 @@
         <label>
           모델
           <select id="modelSelect">
-            <option value="turbo" selected>turbo (권장·빠름)</option>
-            <option value="large-v3">large-v3 (최고정확도)</option>
+            <option value="large-v3" selected>large-v3 (권장/최고정확도)</option>
+            <option value="turbo">turbo (빠름)</option>
             <option value="medium">medium</option>
             <option value="small">small</option>
           </select>
@@ -302,6 +304,7 @@
           <input type="checkbox" id="srtCheck" checked> SRT 자막
         </label>
       </div>
+      <div class="model-hint" id="modelHint"></div>
     </div>
 
     <!-- 유튜브 -->
@@ -773,6 +776,29 @@ function clearConsole() {
 }
 
 // ─────────────────────────────
+// 모델 안내줄
+// ─────────────────────────────
+// 모델별 권장 사양을 한 곳에서 관리한다. vram은 faster-whisper(float16)
+// 실사용 기준이며, gpu는 그 VRAM을 충족하는 대표 카드 예시이다.
+const MODEL_META = {
+  'large-v3': { vram: '6GB+', gpu: 'RTX 3060', speed: '1x', note: '최고 정확도' },
+  'turbo':    { vram: '4GB+', gpu: 'RTX 3050', speed: '8x', note: 'large-v3 근접, 빠름' },
+  'medium':   { vram: '4GB+', gpu: 'GTX 1660', speed: '2x', note: '한국어 양호' },
+  'small':    { vram: '2GB+', gpu: 'GTX 1650', speed: '6x', note: '일반 강의 충분' },
+};
+
+function updateModelHint() {
+  const m = MODEL_META[document.getElementById('modelSelect').value];
+  const el = document.getElementById('modelHint');
+  if (!m) { el.textContent = ''; return; }
+  el.innerHTML =
+    `ⓘ VRAM ${m.vram} (예: ${m.gpu}), 속도 ${m.speed}, ${m.note}` +
+    `<br><span class="sub">GPU 없으면 자동으로 CPU 모드로 동작 (느림)</span>`;
+}
+
+document.getElementById('modelSelect').addEventListener('change', updateModelHint);
+
+// ─────────────────────────────
 // Enter 키로 스캔
 // ─────────────────────────────
 document.getElementById('folderPath').addEventListener('keydown', e => {
@@ -781,6 +807,7 @@ document.getElementById('folderPath').addEventListener('keydown', e => {
 
 // 초기 로드: 최근 폴더 렌더링, 가장 최근 폴더가 있으면 자동 스캔
 window.addEventListener('load', () => {
+  updateModelHint();
   renderRecent();
   const recent = loadRecent();
   if (recent.length) {

@@ -605,7 +605,7 @@ async def ws_transcribe(websocket: WebSocket):
     try:
         data = await websocket.receive_json()
         files: list[str] = data.get("files", [])
-        model_name: str = data.get("model", "turbo")
+        model_name: str = data.get("model", "large-v3")
         language: str = data.get("language", "ko")
         make_srt: bool = data.get("srt", True)
 
@@ -663,7 +663,7 @@ async def ws_youtube(websocket: WebSocket):
         data = await websocket.receive_json()
         url: str = (data.get("url") or "").strip()
         dest_folder: str = (data.get("folder") or "").strip()
-        model_name: str = data.get("model", "turbo")
+        model_name: str = data.get("model", "large-v3")
         language: str = data.get("language", "ko")
         make_srt: bool = data.get("srt", True)
 
