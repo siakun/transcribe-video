@@ -1,32 +1,126 @@
 # transcribe-video
 
-로컬 Whisper(faster-whisper) 기반 동영상 음성인식 도구. FastAPI 서버와 브라우저
-UI(`localhost:8765`)로 로컬 폴더 또는 유튜브 영상을 전사한다.
+로컬 GPU로 도는 동영상 음성인식 도구. 강의/회의 영상을 업로드 없이, 무료로,
+한국어에 강하게 텍스트로 바꾼다. faster-whisper 전사에 더해, 한국어에서 자주
+나오는 Whisper 환각을 걸러내는 다층 후처리와 유튜브 다운로드 전사 파이프라인을
+직접 설계해 붙였다.
 
-![demo](images/demo.png)
+![transcribe-video 실행 화면](images/demo.png)
 
-## 구조
+좌측에서 로컬 폴더나 유튜브 URL을 넣어 영상 목록을 만들고, 우측 콘솔에서 모델
+로딩, GPU, 다운로드/전사 진행률을 실시간으로 본다. 위 화면은 RTX 5080에서
+large-v3 모델로 17개 강의 영상을 일괄 전사하는 모습이다.
 
-소스, 빌드 스크립트, 가상환경은 모두 `transcribe-video/` 프로젝트 폴더 아래에 둔다.
-저장소 메타(README, 문서, 이미지)는 repo 루트에 둔다.
+## 왜 만들었나
+
+다량의 강의 영상을 텍스트로 바꿔 검색하고 다시 보고 싶었다. 상용 STT 서비스는
+세 가지가 걸렸다.
+
+- **비용과 업로드**: 긴 영상이 많을수록 비용이 커지고, 외부 서버로 올려야 한다.
+- **한국어 환각**: 무음/잡음 구간에서 그럴듯한 가짜 문장(자막 크레딧, 반복 문구)을
+  만들어내는 문제가 한국어에서 특히 자주 나온다.
+- **운영 번거로움**: 수십 개 파일을 일괄로, 중단 후 이어서 처리하기 어렵다.
+
+그래서 "내 PC의 GPU로, 무료로, 한국어 품질을 직접 손볼 수 있고, 일괄/이어하기와
+유튜브까지 되는" 도구를 목표로 잡았다. 핵심은 모델을 쓰는 것 자체가 아니라,
+모델이 내는 결과를 실사용 가능한 품질로 끌어올리는 후처리와 운영 설계에 있다.
+
+## 무엇을 하나 (결과)
+
+- **로컬 폴더 일괄 전사**: 폴더를 스캔해 영상 목록을 만들고, 선택 항목을 순차 전사
+- **유튜브 다운로드 전사**: 단일 영상과 재생목록을 받아 다운로드 후 곧바로 전사
+- **GPU 가속**: faster-whisper(CTranslate2), GPU면 float16, 없으면 CPU int8로 자동 전환
+- **출력**: 원본 옆에 `.txt`, 선택 시 `.srt` 자막
+- **실시간 진행률**: WebSocket으로 모델 로딩/다운로드/전사 진행을 콘솔에 스트리밍
+- **이어하기**: 이미 `.txt`가 있는 파일은 건너뛰어 중단 후 재개 가능
+- **네이티브 폴더 선택**: 브라우저가 못 하는 OS 폴더 대화상자를 서버가 띄움
+- **단일 exe 배포**: PyInstaller로 패키징해 Python 설치 없이 실행
+
+기술 스택: Python, FastAPI, WebSocket, faster-whisper, PyTorch(CUDA), NumPy,
+ffmpeg, yt-dlp, PyInstaller.
+
+## 설계로 풀어낸 문제들 (과정)
+
+단순히 라이브러리를 호출하는 데서 멈추지 않고, 실사용에서 마주친 문제를
+설계로 해결했다. 각 항목은 문제, 접근, 근거 순으로 정리한다.
+
+### 1. 한국어 Whisper 환각 제거 (다층 후처리)
+
+- **문제**: Whisper가 무음/잡음 구간에서 자막 크레딧 같은 가짜 문장이나 같은 문구의
+  반복 루프를 만들어낸다. 단순 키워드 차단은 진짜 발화를 오삭제할 위험이 크다.
+- **접근**: 단계가 다른 네 개의 필터를 겹쳤다.
+  - 지표 기반: avg_logprob, no_speech_prob, compression_ratio가 극단적으로 나쁘거나
+    긴 세그먼트인데 글자 밀도가 낮은 경우를 버린다.
+  - 결정론적 반복 루프 탐지: 같은 텍스트가 여러 번 나오면서 반복 간격이 모두 수초
+    이상이면 환각으로 본다. 환각은 같은 입력에 같은 출력을 내는 결정론적 특성이
+    있어 멀리 떨어져 반복된다. 진짜 발화 중 filler 반복("자 이제")과는 "모든 간격이
+    크다"는 조건으로 구분한다.
+  - 관측 문구 정확 일치: 실제로 본 환각 문자열만 그대로 모아 막는다.
+  - Whisper 내장 환각 탐지(word_timestamps + hallucination_silence_threshold)도 켠다.
+- **근거**: 관측 문구를 정규식으로 일반화하지 않았다. 오삭제(진짜 발화를 지움)가
+  미삭제보다 치명적이라고 보고, 일반화의 편의보다 보수성을 택했다. 새 환각을 만날
+  때마다 관측 문자열을 추가하는 운영 방식으로 설계했다.
+
+### 2. 무음 구간 스킵을 위한 직접 구현 VAD
+
+- **문제**: 무음/잡음 구간을 그대로 전사에 넣으면 환각의 입력이 되고 시간도 낭비된다.
+- **접근**: 0.5초 윈도마다 RMS 에너지, zero-crossing rate, 스펙트럼 평탄도, 음성
+  대역(120~4500Hz) 파워 비율을 계산해 음성 후보 구간을 찾고, 이를 Whisper의
+  clip_timestamps로 넘겨 음성 구간만 전사한다.
+- **근거**: clip 범위가 오디오 끝을 넘으면 Whisper가 무한 루프에 빠지는 버그를 만나,
+  마지막 구간 끝을 안전 마진만큼 당기는 장치를 넣었다. 또 음성이 95% 이상이면
+  clip이 이득 없이 엣지케이스만 키우므로 생략하도록 했다.
+
+### 3. 한국어 경로 깨짐 (i18n 디버깅)
+
+- **문제 1**: ffmpeg가 한글이 든 파일 경로를 직접 열지 못하는 경우가 있다.
+- **해결 1**: 영상 파일을 Python에서 열어 ffmpeg stdin(`pipe:0`)으로 흘려보내,
+  ffmpeg가 한글 경로를 직접 다루지 않게 했다.
+- **문제 2**: yt-dlp.exe는 출력이 파이프로 연결되면 콘솔 코드페이지(cp949)로
+  인코딩해, 한글이 든 다운로드 경로 출력이 깨진다.
+- **해결 2**: `--encoding UTF-8`로 출력 인코딩을 UTF-8에 못박아 reader와 맞췄다.
+
+### 4. 단일 exe 빌드의 네이티브 크래시 (패키징 디버깅)
+
+- **문제 1**: 핸들러가 끝날 때 GC가 CTranslate2 모델을 해제하다가 frozen 빌드에서
+  "Fatal Python error: Aborted"로 죽었다.
+- **해결 1**: 모델을 모듈 전역에 1개만 두고 캐시한다. 부수적으로 같은 모델 재사용
+  시 재로딩 비용도 사라졌다.
+- **문제 2**: faster-whisper(CTranslate2)와 PyTorch가 각자 OpenMP 런타임을 들고
+  있어, frozen에서 libomp가 중복 로드되면 종료 시점에 네이티브 abort가 났다.
+- **해결 2**: 진입 전에 `KMP_DUPLICATE_LIB_OK=TRUE`, `OMP_NUM_THREADS=1`로 고정했다.
+
+### 5. 실시간 진행률 스트리밍 아키텍처
+
+- **문제**: faster-whisper의 transcribe는 generator를 반환하고, 그 반복이 실제
+  추론을 트리거한다. 동기 반복을 그대로 두면 비동기 서버가 막힌다.
+- **접근**: generator 반복을 워커 스레드에서 돌리고, 각 세그먼트를 asyncio.Queue로
+  메인 코루틴에 넘겨 WebSocket으로 진행률을 즉시 전송한다. 진행률은 세그먼트 끝
+  시각을 전체 길이로 나눠 계산한다.
+- **근거**: 추론(블로킹)과 전송(비동기)을 큐로 분리해, WebSocket이 중간에 끊겨도
+  전사 자체는 끝까지 가도록 했다.
+
+### 6. 교체 가능한 yt-dlp 운영 설계
+
+- **문제**: 유튜브는 자주 깨져 yt-dlp 업데이트가 잦다. 매번 exe를 재빌드하면 운영이
+  무겁다.
+- **접근**: yt-dlp를 pip 패키지가 아니라 단독 실행파일(`bin/yt-dlp.exe`)로 두고
+  subprocess로 호출한다. 깨지면 exe만 교체하면 된다.
+
+## 구조와 실행
+
+저장소는 메타(README, 문서, 이미지)를 루트에 두고, 프로젝트 본체를 한 겹 아래
+`transcribe-video/`에 모은다. 설계와 모듈별 상세는 [PROJECT.md](PROJECT.md)에 있다.
 
 ```
-transcribe-video/        repo 루트
-├── README.md
-├── images/              README용 이미지
-├── docs/                개발 참고 자료
-└── transcribe-video/    프로젝트 (소스/빌드/venv)
-    ├── pyproject.toml
-    ├── uv.lock
-    ├── src/             서버, CLI, 공용 모듈
-    ├── tests/
-    ├── scripts/         build.ps1, build.bat
-    └── bin/             yt-dlp.exe
+transcribe-video/            repo 루트
+├── README.md  PROJECT.md  images/  docs/
+└── transcribe-video/        프로젝트 (소스/빌드/venv)
+    ├── pyproject.toml  uv.lock
+    └── src/  tests/  scripts/  bin/
 ```
 
-## 개발
-
-모든 명령은 프로젝트 폴더에서 실행한다.
+개발 환경 준비와 실행(모든 명령은 프로젝트 폴더에서):
 
 ```
 cd transcribe-video
@@ -34,8 +128,8 @@ uv venv
 uv sync --group dev
 ```
 
-- 서버: `uv run python src/server.py` (브라우저에서 http://localhost:8765 접속)
-- CLI: `uv run python src/transcribe_video.py <영상 파일 또는 폴더>`
+- 서버: `uv run python src/server.py` (브라우저에서 http://localhost:8765)
+- CLI: `uv run python src/transcribe_video.py <영상 또는 폴더> [--batch] [--srt]`
 - 테스트: `uv run pytest`
 
 ## 빌드 (Windows, PyInstaller)
@@ -45,5 +139,13 @@ cd transcribe-video
 scripts\build.bat
 ```
 
-산출물은 `transcribe-video/build/<타임스탬프>/whisper_server/`에 생성된다. 실행 시점에
-PATH에 `ffmpeg`가 설치되어 있어야 한다.
+산출물은 `transcribe-video/build/<타임스탬프>/whisper_server/`에 생성된다. 실행
+시점에 PATH에 `ffmpeg`가 설치되어 있어야 한다.
+
+## 회고
+
+이 프로젝트의 핵심은 모델을 호출하는 코드가 아니라, 모델이 내는 결과를 실사용
+품질로 끌어올린 후처리와 운영 설계다. 환각 필터 하나를 두고도 "일반화로 더 많이
+잡을 것인가, 보수적으로 오삭제를 막을 것인가"를 명시적으로 선택했고, 단일 exe로
+배포하기까지 네이티브 레벨의 크래시를 추적해 해결했다. 라이브러리 사용을 넘어,
+실제로 쓰이는 도구가 갖춰야 할 견고함을 설계로 만들어낸 경험이다.
