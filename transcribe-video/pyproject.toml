@@ -28,3 +28,7 @@ torch = [
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
+
+[tool.pytest.ini_options]
+# 테스트가 src/ 의 모듈을 import할 수 있도록 경로 추가. (구 conftest.py 대체)
+pythonpath = ["src"]

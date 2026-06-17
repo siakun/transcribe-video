@@ -25,8 +25,11 @@ if ($Rest -and ($Rest -contains '--no-pause')) { $NoPause = $true }
 # checked explicitly via $LASTEXITCODE.
 $ErrorActionPreference = 'Stop'
 
-$ScriptRoot = $PSScriptRoot
-if (-not $ScriptRoot) { $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition }
+# build.ps1 lives in <project>/scripts/, so the project root is the parent dir.
+# All paths below resolve against $ScriptRoot, so it must point at the project root.
+$ScriptDir = $PSScriptRoot
+if (-not $ScriptDir) { $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition }
+$ScriptRoot = Split-Path -Parent $ScriptDir
 Set-Location -LiteralPath $ScriptRoot
 
 # --- Configuration ----------------------------------------------------------
