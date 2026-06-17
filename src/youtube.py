@@ -106,22 +106,24 @@ def resolve(url: str) -> ResolveResult:
     return _parse_resolve_json(data)
 
 
-def download(video_url: str, dest_dir: Path,
-             progress_cb: Callable[[float], None]) -> Path:
-    """영상을 dest_dir에 mp4로 다운로드한다. 다운로드된 파일 경로를 반환.
+def _build_download_cmd(ytdlp: Path, video_url: str, dest_dir: Path) -> list[str]:
+    """download()가 실행할 yt-dlp 명령줄을 조립한다.
 
-    progress_cb는 0~100 사이 퍼센트로 호출된다. 블로킹 함수다.
+    --encoding UTF-8 이 핵심이다. yt-dlp.exe는 stdout이 파이프로 연결되면
+    콘솔 코드페이지(한국어 Windows면 cp949)로 출력을 인코딩한다. 그런데
+    download()는 stdout을 UTF-8로 읽으므로, 한글이 든 DLPATH 줄이 깨져
+    파일 경로를 못 찾는다. 출력 인코딩을 UTF-8로 못박아 reader와 맞춘다.
     """
-    ytdlp = find_ytdlp()
-    dest_dir.mkdir(parents=True, exist_ok=True)
     out_template = str(dest_dir / "%(title).180B [%(id)s].%(ext)s")
-    cmd = [
+    return [
         str(ytdlp),
         "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
         "--merge-output-format", "mp4",
         "--no-playlist",
         "--no-overwrites",
         "--windows-filenames",
+        # 파이프 출력을 UTF-8로 강제 — DLPATH/DLPCT 줄을 UTF-8로 읽기 위함.
+        "--encoding", "UTF-8",
         "--newline",
         # --print이 --quiet을 함의해 진행률 출력이 막히므로, --progress로
         # quiet 상태에서도 진행바(progress-template)를 강제로 켠다.
@@ -131,6 +133,17 @@ def download(video_url: str, dest_dir: Path,
         "-o", out_template,
         video_url,
     ]
+
+
+def download(video_url: str, dest_dir: Path,
+             progress_cb: Callable[[float], None]) -> Path:
+    """영상을 dest_dir에 mp4로 다운로드한다. 다운로드된 파일 경로를 반환.
+
+    progress_cb는 0~100 사이 퍼센트로 호출된다. 블로킹 함수다.
+    """
+    ytdlp = find_ytdlp()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    cmd = _build_download_cmd(ytdlp, video_url, dest_dir)
     try:
         proc = subprocess.Popen(
             cmd,

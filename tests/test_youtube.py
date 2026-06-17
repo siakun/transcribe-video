@@ -1,4 +1,6 @@
-from youtube import _parse_resolve_json, sanitize_filename
+from pathlib import Path
+
+from youtube import _build_download_cmd, _parse_resolve_json, sanitize_filename
 
 
 def test_sanitize_filename_replaces_reserved_chars():
@@ -36,3 +38,14 @@ def test_parse_playlist():
     assert result.playlist_title == "파이썬_ 기초_심화"  # : 와 / 가 _ 로 치환
     assert len(result.entries) == 2
     assert [e.id for e in result.entries] == ["v1", "v2"]
+
+
+def test_download_cmd_forces_utf8_output():
+    # yt-dlp.exe는 파이프 출력 시 콘솔 코드페이지(cp949 등)를 쓰지만
+    # download()는 stdout을 UTF-8로 읽는다. --encoding UTF-8 로 출력을
+    # 못박지 않으면 한글 파일 경로(DLPATH)가 깨져 다운로드가 실패한다.
+    cmd = _build_download_cmd(Path("yt-dlp.exe"),
+                              "https://www.youtube.com/watch?v=abc123",
+                              Path("dest"))
+    assert "--encoding" in cmd
+    assert cmd[cmd.index("--encoding") + 1].lower() == "utf-8"
