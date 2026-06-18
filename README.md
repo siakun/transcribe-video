@@ -107,20 +107,35 @@ ffmpeg, yt-dlp, PyInstaller.
 - **접근**: yt-dlp를 pip 패키지가 아니라 단독 실행파일(`bin/yt-dlp.exe`)로 두고
   subprocess로 호출한다. 깨지면 exe만 교체하면 된다.
 
-## 구조와 실행
+## 빠른 시작
 
-저장소는 메타(README, 문서, 이미지)를 루트에 두고, 프로젝트 본체를 한 겹 아래
-`transcribe-video/`에 모은다. 설계와 모듈별 상세는 [PROJECT.md](PROJECT.md)에 있다.
+받은 뒤 루트의 `start.bat`을 더블클릭하면 끝이다. 동작은 exe처럼 캡슐화돼 있다.
+
+- 처음이거나 소스가 바뀌었으면 자동으로 빌드하고,
+- 바뀐 게 없으면 마지막 빌드를 그대로 실행한 뒤,
+- 서버를 띄우고 브라우저(http://localhost:8765)를 연다.
+
+변경 감지는 소스 내용 해시로 하므로, 다운로드 방식이나 파일 시각과 무관하게 "코드가
+실제로 바뀌었을 때만" 다시 빌드한다(중복 빌드 방지). 첫 실행은 환경 준비(uv sync)와
+빌드로 시간이 걸릴 수 있고, `uv`가 설치돼 있어야 한다.
+
+## 구조
+
+저장소는 메타(README, 문서, 이미지)와 진입점(start)을 루트에 두고, 프로젝트 본체를
+한 겹 아래 `transcribe-video/`에 모은다. 설계와 모듈별 상세는 [PROJECT.md](PROJECT.md)에 있다.
 
 ```
 transcribe-video/            repo 루트
+├── start.bat  start.ps1     사용자용 진입점 (변경 시 빌드 후 실행)
 ├── README.md  PROJECT.md  images/  docs/
 └── transcribe-video/        프로젝트 (소스/빌드/venv)
     ├── pyproject.toml  uv.lock
     └── src/  tests/  scripts/  bin/
 ```
 
-개발 환경 준비와 실행(모든 명령은 프로젝트 폴더에서):
+## 개발
+
+개발자는 프로젝트 폴더에서 직접 다룬다.
 
 ```
 cd transcribe-video
@@ -131,16 +146,10 @@ uv sync --group dev
 - 서버: `uv run python src/server.py` (브라우저에서 http://localhost:8765)
 - CLI: `uv run python src/transcribe_video.py <영상 또는 폴더> [--batch] [--srt]`
 - 테스트: `uv run pytest`
+- 빌드 엔진 직접 호출: `transcribe-video\scripts\build.bat` (보통은 start.bat이 대신 부른다)
 
-## 빌드 (Windows, PyInstaller)
-
-```
-cd transcribe-video
-scripts\build.bat
-```
-
-산출물은 `transcribe-video/build/<타임스탬프>/whisper_server/`에 생성된다. 실행
-시점에 PATH에 `ffmpeg`가 설치되어 있어야 한다.
+산출물은 `transcribe-video/build/<타임스탬프>/whisper_server/`에 생성되고, 실행
+시점에 PATH에 `ffmpeg`가 설치돼 있어야 한다.
 
 ## 회고
 
