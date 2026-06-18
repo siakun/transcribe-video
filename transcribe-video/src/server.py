@@ -11,6 +11,7 @@ import threading
 import logging
 import tempfile
 import faulthandler
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, TextIO
@@ -146,18 +147,17 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
-app = FastAPI(title="Whisper 음성인식 서버")
-LOGGER.info("FastAPI imports completed")
-
-
-@app.on_event("startup")
-async def log_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # FastAPI 0.93+ 권장 방식. on_event(startup/shutdown)은 deprecated이므로
+    # yield 앞을 startup, 뒤를 shutdown 훅으로 사용한다.
     LOGGER.info("Application startup complete")
-
-
-@app.on_event("shutdown")
-async def log_shutdown():
+    yield
     LOGGER.info("Application shutdown complete")
+
+
+app = FastAPI(title="Whisper 음성인식 서버", lifespan=lifespan)
+LOGGER.info("FastAPI imports completed")
 
 # ─────────────────────────────────────────────
 # 전역 상태
